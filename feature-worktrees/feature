@@ -1,0 +1,1354 @@
+#!/usr/bin/env bash
+# feature —— 跨工程的「特性 worktree」管理（用户 2026-10-13 拍板的 A 方案）
+#
+# 布局：<特性根>/<特性名>/<工程名>/，每个参与工程统一分支 feat/<特性名>。
+# 目的：让「在开哪个特性」从路径上一眼可见（ls $FEATURES_ROOT），并让每个特性
+# 拥有自己的一组 worktree——任何 commit 都只可能落在其中（由 feature-guard.sh 强制）。
+#
+# 用法：feature <子命令>；不带参数打印用法。
+
+set -uo pipefail
+HERE=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")" && pwd)
+# shellcheck source=feature-lib.sh
+. "$HERE/feature-lib.sh"
+
+die()  { printf 'feature: %s\n' "$*" >&2; exit 1; }
+note() { printf '%s\n' "$*"; }
+
+usage() {
+  cat <<'EOF'
+feature —— 跨工程特性 worktree：会话主动关联 + 生命周期
+
+【关联：动手前先把这个会话绑到一个 worktree】
+  feature attach <特性名> [工程名]      关联当前会话（写 <特性根>/.sessions/<会话id>.json）
+  feature switch <特性名> [工程名]      切换：解除旧关联再关联新的
+  feature detach                        解除关联
+  feature status                        我这个会话现在关联在哪、那个 worktree 什么状态
+
+【基础操作】
+  feature new <特性名> --repos <工程名,...> [--title "..."] [--from <ref>]
+        建 <特性根>/<特性名>/<工程名>/ 并检出 feat/<特性名>（分支不存在则新建），**并自动关联本会话**
+  feature resume <特性名> [工程名]       恢复到该 worktree：先关联，再打印完整上下文
+  feature list [--all|--branches]       列出特性（--all 含已回收；--branches 附未收编分支）
+  feature path <特性名> [工程名]         打印 worktree 路径（便于 cd）
+  feature check [...]                   用与钩子**同一套**规则做判定（放行 0 / 阻断 2）
+
+【上下文恢复：这个 worktree 干了什么】
+  feature context [特性名] [--full]     分支/相对 main 的提交与改动规模/未提交/日志/相关笔记与看板
+  feature journal <特性名> "<一句话>"    追加一条工作日志（意图与结论；事实以 git log 为准）
+
+【同步：把父级的最新代码合进 worktree（级联：main → 源特性 → worker）】
+  feature sync [<特性名>|--all] [--from=<ref>] [--check]
+        worker 特性（ns-<卡片id前12位>）的父级 = 该卡"源会话"关联的特性；其余特性父级 = main。
+        解析不到父级（卡不在板上 / 会话未关联 / 源特性已回收）⇒ 回落 main。
+        只做 git merge --no-ff（不 rebase、不 force）；已包含 ⇒ no-op；worktree 脏 ⇒ 拒绝；
+        冲突 ⇒ merge --abort 并保持原状。--check 只打印计划。
+
+【回收：特性验收后合并到主干并回收 worker】
+  feature recycle <特性名> [--yes] [--push] [--delete-branch] [--keep-worktree] [--no-redirect]
+        预检（worktree 干净、主检出干净）→ 主检出切 main → merge --no-ff feat/<特性名>
+        → 移除 worktree，**并在原地留一个指向主检出的路标（符号链接）**
+        →（可选）删分支/推主干 → 标记 status=recycled → 解除相关会话关联
+        不留 --yes 只打印计划，不动手
+  feature close <特性名> [--delete-branch] [--force]
+        只拆除 worktree（不合并）；用于放弃某特性。会在特性目录留 CLOSED.md 墓碑
+  feature prune <特性名|--all> [--purge] [--yes]
+        清理已回收特性留下的路标（**只删符号链接，绝不删主检出**）；--purge 连注册记录一起清
+        （journal.md 保留为 <特性名>.history-<时间>.md）
+  feature relink <特性名|--all> [--yes]
+        给已回收特性**补/重建路标**：早期回收（路标功能之前）或路标被删后，旧路径已失联时用
+
+  关于「路标」：回收会拆掉 worktree，但旧路径不会变成死链——它是一个指向主检出的符号链接，
+  所以会话里引用过的 @路径 仍然可读（内容 = 主检出当前状态）。它**只保证读**：往那里写/提交
+  会被 feature-guard 拦下（git 会把路标解析回主检出）。
+
+【未值守：按需创建 + 权限预检】
+  feature ensure <特性名> --repos <工程名,...> [--title ...]
+        幂等入口：特性不在就建、在就核对 worktree 并关联本会话；未值守会话只该调这一条
+  feature preflight [--repos <工程名,...>] [--quiet]
+        真写探针 + `git worktree add --no-checkout` 实跑：验证**当前会话不需要任何人批准**
+        就能按需建 worktree；失败会打印确切修法（部署层 DSH_PERMISSION_MODE / 单会话切权限）
+
+【运维】
+  feature audit                         工作状态体检：主检出分支/未提交、各 worktree 的改动与领先落后、未推送、可回收、孤儿、已回收路标
+  feature rescue <特性名> [--project 工程] [--yes]
+        把**主检出里滞留的未提交改动**搬进该特性的 worktree（stash → apply，stash 保留作备份；默认只打印计划）
+  feature repo add <工程名> <主检出路径>；feature repo list
+  feature doctor                        自检：注册表/worktree/分支/路标/钩子/技能安装 + 权限预检是否一致
+
+约定：
+  · 特性名 kebab-case（人可读，替代 devloop-round-N 这类无语义编号）
+  · 分支统一 feat/<特性名>；工程主检出留在登记表里的路径，只作主干与合并用
+  · 关联是**按会话**的（DSH_SESSION_ID）：两个会话可以各自开各自的特性，互不抢
+  · FEATURE_ROOT / config.featuresRoot 可覆盖默认特性根
+EOF
+}
+
+slug_ok() { printf '%s' "$1" | grep -qE '^[a-z0-9][a-z0-9._-]*$'; }
+
+ensure_root() { mkdir -p "$FEATURES_ROOT" || die "无法创建 $FEATURES_ROOT"; }
+
+repo_path_for() { # <工程名> → 主检出路径（只认工程登记表；不猜主机路径）
+  local p=$1 r
+  r=$(repo_registered_path "$p")
+  printf '%s\n' "$r"
+}
+
+register_repo() { # <工程名> <路径>
+  ensure_root
+  [ -f "$REPOS_FILE" ] || printf '{}\n' > "$REPOS_FILE"
+  local tmp; tmp=$(mktemp)
+  jq --arg p "$1" --arg r "$2" '.[$p] = $r' "$REPOS_FILE" > "$tmp" && mv "$tmp" "$REPOS_FILE"
+}
+
+cmd_repo() {
+  local sub=${1:-list}; shift || true
+  case "$sub" in
+    add)
+      [ $# -ge 2 ] || die "用法：feature repo add <工程名> <主检出路径>"
+      local name=$1 path=$2
+      [ -d "$path" ] || die "路径不存在：$path"
+      [ -e "$path/.git" ] || die "不是 git 仓库（缺 .git）：$path"
+      register_repo "$name" "$(cd "$path" && pwd)"
+      note "已登记工程：$name → $(cd "$path" && pwd)"
+      ;;
+    list)
+      if [ -f "$REPOS_FILE" ]; then jq -r 'to_entries[] | "  \(.key)\t\(.value)"' "$REPOS_FILE"
+      else note "  （未登记任何工程）"; fi
+      ;;
+    *) die "未知 repo 子命令：$sub" ;;
+  esac
+}
+
+cmd_new() {
+  local slug="" title="" from="" repos=""
+  [ $# -ge 1 ] || die "用法：feature new <特性名> --repos a,b"
+  slug=$1; shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repos) repos=${2:-}; shift 2 ;;
+      --title) title=${2:-}; shift 2 ;;
+      --from)  from=${2:-};  shift 2 ;;
+      *) die "未知参数：$1" ;;
+    esac
+  done
+  slug_ok "$slug" || die "特性名不合法（要求 kebab-case：$slug）"
+  [ -n "$repos" ] || die "必须给 --repos <工程名,...>"
+  [ -f "$FEATURES_ROOT/$slug/feature.json" ] && die "特性已存在：$slug"
+  # 目录在但没记录 = 上次回收留下的路标目录 / 上次 close 留下的墓碑。直接往上建 worktree
+  # 会与残留的符号链接或历史文件打架（git worktree add 要求目标目录不存在或为空）。
+  [ -e "$FEATURES_ROOT/$slug" ] && die "目录已存在但不是一个在用特性：$FEATURES_ROOT/$slug
+  （多半是已回收特性的路标目录，或已关闭特性的墓碑——里面还有 journal.md）
+  处理办法：feature prune $slug --purge 清理后再用这个名字，或换一个特性名（推荐：名字就是这次改动的语义）"
+  ensure_root
+
+  local branch="feat/$slug" proj repo wt created
+  local -a made=() plist=()
+  # 用数组+for 而不是 `while read < <(...)`：后者会被循环体里的 git 吃掉剩余行（实测）。
+  IFS=',' read -r -a plist <<< "$repos"
+  for proj in "${plist[@]}"; do
+    [ -n "$proj" ] || continue
+    repo=$(repo_path_for "$proj")
+    [ -e "$repo/.git" ] || die "工程 $proj 不是 git 仓库：$repo（先 feature repo add）"
+    wt="$FEATURES_ROOT/$slug/$proj"
+    register_repo "$proj" "$repo"
+    if gitr -C "$repo" show-ref --verify --quiet "refs/heads/$branch"; then
+      local cur; cur=$(gitr -C "$repo" branch --show-current)
+      [ "$cur" = "$branch" ] && die "分支 $branch 正被主检出占用（$repo）；先把主检出切回基准分支，再建 worktree"
+      gitr -C "$repo" worktree add "$wt" "$branch" >/dev/null || die "worktree add 失败：$repo → $wt"
+    else
+      gitr -C "$repo" worktree add -b "$branch" "$wt" "${from:-HEAD}" >/dev/null \
+        || die "worktree add -b 失败：$repo → $wt"
+    fi
+    made+=("$proj")
+    note "  worktree  $proj → $wt（$branch）"
+  done
+
+  created=$(date -Is)
+  local tmp; tmp=$(mktemp)
+  {
+    printf '{\n  "slug": %s,\n' "$(jq -Rn --arg v "$slug" '$v')"
+    printf '  "title": %s,\n' "$(jq -Rn --arg v "${title:-$slug}" '$v')"
+    printf '  "created": %s,\n  "status": "active",\n  "branch": %s,\n  "repos": {\n' \
+      "$(jq -Rn --arg v "$created" '$v')" "$(jq -Rn --arg v "$branch" '$v')"
+    local first=1
+    for proj in "${made[@]}"; do
+      [ "$first" = 1 ] || printf ',\n'; first=0
+      printf '    %s: {\n      "repo": %s,\n      "path": %s,\n      "branch": %s,\n      "remote": %s\n    }' \
+        "$(jq -Rn --arg v "$proj" '$v')" \
+        "$(jq -Rn --arg v "$(repo_path_for "$proj")" '$v')" \
+        "$(jq -Rn --arg v "$FEATURES_ROOT/$slug/$proj" '$v')" \
+        "$(jq -Rn --arg v "$branch" '$v')" \
+        "$(jq -Rn --arg v "$(gitr -C "$(repo_path_for "$proj")" remote 2>/dev/null | grep -x gitea || echo '')" '$v')"
+    done
+    printf '\n  }\n}\n'
+  } > "$tmp"
+  jq -e . "$tmp" >/dev/null || { rm -f "$tmp"; die "feature.json 生成失败（JSON 非法）"; }
+  mv "$tmp" "$FEATURES_ROOT/$slug/feature.json"
+  printf '%s\n' "$slug" > "$ACTIVE_FILE"
+  note "特性已建：$slug（工程：${made[*]}）"
+  # 建完**自动关联本会话**：worker 一开工就绑在它自己的 worktree 上（用户要求：动手前先关联）
+  local sid; sid=$(sid_now)
+  if [ -n "$sid" ]; then
+    bind_session "$sid" "$slug" "${made[0]}" "$FEATURES_ROOT/$slug/${made[0]}"
+    journal_add "$slug" "会话 $sid 新建并关联（工程：${made[*]}）"
+    note "  已自动关联本会话（$sid）→ $FEATURES_ROOT/$slug/${made[0]}"
+  fi
+}
+
+wt_status() { # <repo> <wt> → 一行状态
+  local repo=$1 wt=$2 d a b
+  [ -d "$wt" ] || { printf '缺失'; return; }
+  gitr -C "$repo" worktree list --porcelain 2>/dev/null | grep -qx "worktree $wt" || { printf '非 worktree'; return; }
+  d=$(gitr -C "$wt" status --porcelain 2>/dev/null | wc -l)
+  local base; base=$(repo_base_branch "$repo")
+  # rev-list --left-right --count <base>...HEAD：左=只在基准分支（落后），右=只在 HEAD（领先）
+  read -r a b < <(gitr -C "$wt" rev-list --left-right --count "$base...HEAD" 2>/dev/null || echo '? ?')
+  local s="干净"; [ "$d" -gt 0 ] && s="改动${d}"
+  if [ "${a:-?}" != "0" ] && [ "${a:-?}" != "?" ]; then
+    printf '%s 领先%s:%s 落后%s:%s' "$s" "$base" "${b:-?}" "$base" "$a"
+  else
+    printf '%s 领先%s:%s' "$s" "$base" "${b:-?}"
+  fi
+}
+
+cmd_list() {
+  local with_branches=0 show_all=0
+  local a
+  for a in "$@"; do
+    [ "$a" = "--branches" ] && with_branches=1
+    [ "$a" = "--all" ] && show_all=1
+  done
+  local sid; sid=$(session_id_now)
+  local bound; bound=$(session_feature "$sid" 2>/dev/null || true)
+  local any=0 slug proj st
+  printf '%-30s %-10s %-30s %s\n' 特性 工程 分支 "worktree 状态"
+  for slug in $(feature_slugs); do
+    st=$(feature_json "$slug" | jq -r '.status // "active"')
+    [ "$st" = "recycled" ] && [ "$show_all" = 0 ] && continue
+    any=1
+    local mark=" "
+    [ "$slug" = "$bound" ] && mark="*"                    # * = 本会话关联的特性（按会话，不抢）
+    [ "$st" = "recycled" ] && mark="✓"                    # ✓ = 已回收
+    while IFS= read -r proj; do
+      [ -n "$proj" ] || continue
+      local wtp ws
+      wtp=$(feature_wt_path "$slug" "$proj")
+      if [ "$st" = recycled ]; then
+        if [ -L "$wtp" ]; then ws="$wtp  [已回收 → $(retired_target "$slug" "$proj")（可读）]"
+        else ws="$wtp  [已回收，无路标]"; fi
+      else
+        ws="$wtp  [$(wt_status "$(feature_repo_path "$slug" "$proj")" "$wtp")]"
+      fi
+      printf '%s%-29s %-10s %-30s %s\n' "$mark" "$slug" "$proj" \
+        "$(feature_branch "$slug" "$proj")" "$ws"
+    done < <(feature_projects "$slug")
+  done
+  [ "$any" = 1 ] || note "（还没有任何特性；用 feature new <特性名> --repos <工程名> 建一个）"
+  [ -n "$bound" ] && note "本会话（$sid）关联：$bound"
+  [ -z "$bound" ] && note "本会话未关联任何特性 —— worker 动手前请先 feature attach <特性名>（或到 worktree 目录里开工）"
+  [ -n "$(active_slug || true)" ] && note "兜底 .active：$(active_slug)"
+
+  if [ "$with_branches" = 1 ]; then
+    note ""
+    note "未收编分支（登记工程里不属于任何特性的本地分支）——「✓」表示已并入 main，可安全删除："
+    local repos_seen=""
+    for slug in $(feature_slugs); do
+      while IFS= read -r proj; do
+        [ -n "$proj" ] || continue
+        case " $repos_seen " in *" $proj "*) continue ;; esac
+        repos_seen="$repos_seen $proj"
+        list_unclaimed_branches "$proj"
+      done < <(feature_projects "$slug")
+    done
+    if [ -f "$REPOS_FILE" ]; then
+      while IFS= read -r proj; do
+        [ -n "$proj" ] || continue
+        case " $repos_seen " in *" $proj "*) continue ;; esac
+        repos_seen="$repos_seen $proj"
+        list_unclaimed_branches "$proj"
+      done < <(jq -r 'keys[]' "$REPOS_FILE" 2>/dev/null)
+    fi
+  fi
+}
+
+list_unclaimed_branches() { # <工程名>
+  local proj=$1 repo br claimed merged
+  repo=$(repo_path_for "$proj")
+  [ -e "$repo/.git" ] || return 0
+  claimed=" "
+  local slug
+  for slug in $(feature_slugs); do
+    br=$(feature_branch "$slug" "$proj"); [ -n "$br" ] && claimed="$claimed$br "
+  done
+  while IFS= read -r br; do
+    [ -n "$br" ] || continue
+    [ "$br" = "$(repo_base_branch "$repo")" ] && continue
+    case "$claimed" in *" $br "*) continue ;; esac
+    merged=$(gitr -C "$repo" branch --merged "$(repo_base_branch "$repo")" 2>/dev/null | tr -d ' *' | grep -qx "$br" && echo ✓ || echo ✗)
+    printf '  %-10s %-34s %s\n' "$proj" "$br" "$merged"
+  done < <(gitr -C "$repo" for-each-ref --format='%(refname:short)' refs/heads 2>/dev/null)
+}
+
+cmd_current() {
+  local arg=${1:-}
+  case "$arg" in
+    "") local s; s=$(active_slug); [ -n "$s" ] && printf '%s\n' "$s" || { printf '(未设置)\n'; return 1; } ;;
+    clear) rm -f "$ACTIVE_FILE"; note "已清除当前特性" ;;
+    *) [ -f "$FEATURES_ROOT/$arg/feature.json" ] || die "没有这个特性：$arg"
+       printf '%s\n' "$arg" > "$ACTIVE_FILE"; note "当前特性：$arg" ;;
+  esac
+}
+
+cmd_path() {
+  local slug=${1:-} proj=${2:-}
+  [ -n "$slug" ] || die "用法：feature path <特性名> [工程名]"
+  [ -f "$FEATURES_ROOT/$slug/feature.json" ] || die "没有这个特性：$slug"
+  if [ -n "$proj" ]; then feature_wt_path "$slug" "$proj"; else printf '%s\n' "$FEATURES_ROOT/$slug"; fi
+}
+
+cmd_close() {
+  local slug=${1:-}; shift || true
+  local del=0 force=0
+  while [ $# -gt 0 ]; do case "$1" in
+    --delete-branch) del=1; shift ;;
+    --force) force=1; shift ;;
+    *) shift ;;
+  esac; done
+  [ -n "$slug" ] || die "用法：feature close <特性名> [--delete-branch] [--force]"
+  [ -f "$FEATURES_ROOT/$slug/feature.json" ] || die "没有这个特性：$slug"
+  feature_is_recycled "$slug" \
+    && die "特性 $slug 已回收（是「并入主干」，不是「放弃」）——要清理它留下的路标：feature prune $slug --purge"
+  local proj repo wt br
+  while IFS= read -r proj; do
+    [ -n "$proj" ] || continue
+    repo=$(feature_repo_path "$slug" "$proj"); wt=$(feature_wt_path "$slug" "$proj"); br=$(feature_branch "$slug" "$proj")
+    if [ -d "$wt" ]; then
+      gitr -C "$repo" worktree remove ${force:+--force} "$wt" && note "  已移除 worktree $wt"
+    fi
+    if [ "$del" = 1 ] && [ -n "$br" ]; then
+      gitr -C "$repo" branch -d "$br" >/dev/null 2>&1 && note "  已删除分支 $br" \
+        || note "  分支未删除（未合并到基准分支或仍被占用）：$br"
+    fi
+  done < <(feature_projects "$slug")
+  # 墓碑（2026-10-15）：close 是「放弃」，所以**不能**像 recycle 那样留指向主检出的路标
+  # （代码根本没合进去，那样是撒谎）。留下的是说明：代码在哪个分支里、怎么把它读出来。
+  {
+    printf '# 已关闭（放弃）：%s\n\n' "$slug"
+    printf '关闭时间：%s\n\n' "$(date -Is)"
+    printf '这个特性**没有合并**到主干。worktree 已拆除，所以旧路径不再可访问（这里刻意不建路标：\n'
+    printf '代码不在主干里，指向主干等于把人带错地方）。代码还在分支里（除非用了 --delete-branch）：\n\n'
+    while IFS= read -r proj; do
+      [ -n "$proj" ] || continue
+      repo=$(feature_repo_path "$slug" "$proj"); br=$(feature_branch "$slug" "$proj")
+      if gitr -C "$repo" show-ref --verify --quiet "refs/heads/$br"; then
+        printf -- '- 工程 `%s`（%s）：分支 `%s`\n' "$proj" "$repo" "$br"
+        printf -- '  · 看提交：`git -C %s log --oneline %s`\n' "$repo" "$br"
+        printf -- '  · 读文件：`git -C %s show %s:<路径>`\n' "$repo" "$br"
+      else
+        printf -- '- 工程 `%s`（%s）：分支 `%s` 已删除\n' "$proj" "$repo" "$br"
+      fi
+    done < <(feature_projects "$slug")
+    printf '\n要重开这个特性：`feature new %s --repos <工程名> --from %s`（把分支当起点）。\n' "$slug" "$(feature_branch "$slug" "$(pick_project "$slug")")"
+  } > "$FEATURES_ROOT/$slug/CLOSED.md"
+  # 关联要一起解除（2026-10-15 由自测抓到）：close 之后 worktree 没了、记录也删了，
+  # 但绑定文件还指着这个特性 ⇒ 相关会话的 status/doctor 会一直报「关联的 worktree 不存在」，
+  # 而且下一个会话看到的是个幽灵。recycle 早就这么做了，close 漏了。
+  local sid
+  for sid in $(sessions_of_feature "$slug"); do unbind_session "$sid"; note "  已解除会话关联：$sid"; done
+  rm -f "$FEATURES_ROOT/$slug/feature.json"
+  [ "$(active_slug)" = "$slug" ] && rm -f "$ACTIVE_FILE"
+  note "特性已关闭：$slug（注册记录已删；分支默认保留）"
+  note "  墓碑留在：$FEATURES_ROOT/$slug/CLOSED.md（说明代码在哪个分支、怎么读出来）"
+  note "  要复用这个名字：feature prune $slug --purge（会清掉墓碑；想留证据就先自己备份）"
+}
+
+cmd_doctor() {
+  local bad=0 slug proj repo wt br
+  command -v jq >/dev/null || { note "✗ 缺 jq（钩子与 CLI 都无法解析 JSON）"; bad=1; }
+  local dsh_hooks="${DSH_HOME:-$HOME/.dsh}/hooks"
+  for f in "$HERE/feature-lib.sh" "$HERE/feature-guard.sh" "$dsh_hooks/feature-guard.sh" \
+           "$dsh_hooks/pre-tool.sh" "$dsh_hooks/post-edit.sh" "$dsh_hooks/session-start.sh"; do
+    [ -e "$f" ] && note "✓ $f" || { note "✗ 缺失 $f"; bad=1; }
+  done
+  # 技能：装到主机级后，本机所有会话的 skill 目录里都该出现 feature-worktree
+  if [ -f "${DSH_HOME:-$HOME/.dsh}/skills/feature-worktree/SKILL.md" ]; then
+    note "✓ 技能已装：${DSH_HOME:-$HOME/.dsh}/skills/feature-worktree/SKILL.md"
+  else
+    note "✗ 技能未装（跑 install.sh）——没有它，会话不会主动来关联 worktree"; bad=1
+  fi
+  local sid bound
+  sid=$(session_id_now); bound=$(session_feature "$sid" 2>/dev/null || true)
+  if [ -n "$sid" ]; then
+    note "· 本会话 $sid 的关联：${bound:-<无>}"
+    if [ -n "$bound" ] && [ ! -d "$(session_worktree "$sid")" ]; then
+      if feature_is_recycled "$bound"; then
+        note "· 关联指向的特性已回收（$(feature_json "$bound" | jq -r '.recycledAt // "?"')）：$(session_worktree "$sid")（历史绑定，feature detach 可清）"
+      else
+        note "✗ 关联指向的 worktree 不存在：$(session_worktree "$sid")"; bad=1
+      fi
+    fi
+  fi
+  for slug in $(feature_slugs); do
+    while IFS= read -r proj; do
+      [ -n "$proj" ] || continue
+      repo=$(feature_repo_path "$slug" "$proj"); wt=$(feature_wt_path "$slug" "$proj"); br=$(feature_branch "$slug" "$proj")
+      # 已回收：worktree 本来就该没了，原地应当是路标（指向主检出的符号链接）
+      if feature_is_recycled "$slug"; then
+        if [ -L "$wt" ]; then
+          if [ -e "$wt" ]; then note "✓ $slug/$proj：已回收，路标可读 $wt → $(readlink -f "$wt" 2>/dev/null)"
+          else note "✗ $slug/$proj：路标是断链（指向不存在的主检出）：$wt"; bad=1; fi
+        elif [ -d "$wt" ]; then
+          note "⚠ $slug/$proj：已回收但仍留着**真实目录** $wt（确认不是别人的 worktree 后：feature prune $slug --yes）"
+        else
+          note "· $slug/$proj：已回收，未留路标（旧路径不可读；回收时用了 --no-redirect / --keep-worktree）"
+        fi
+        continue
+      fi
+      if [ ! -d "$wt" ]; then note "✗ $slug/$proj：worktree 不存在 $wt"; bad=1; continue; fi
+      if ! gitr -C "$repo" worktree list --porcelain 2>/dev/null | grep -qx "worktree $wt"; then
+        note "✗ $slug/$proj：$wt 不是 $repo 的注册 worktree"; bad=1; continue; fi
+      local cur; cur=$(gitr -C "$wt" branch --show-current)
+      [ "$cur" = "$br" ] && note "✓ $slug/$proj：$wt（$cur）" || { note "✗ $slug/$proj：worktree 在 $cur，应为 $br"; bad=1; }
+    done < <(feature_projects "$slug")
+  done
+  # 权限/能力预检（2026-10-15）：这是「未值守能不能按需建 worktree」的唯一判据，
+  # 所以并进 doctor —— 任何人跑一次自检就能提前发现「到跑批时才要审批」这类问题。
+  note ""
+  note "== 权限预检（未值守按需建 worktree）=="
+  cmd_preflight || bad=1
+  [ "$bad" = 0 ] && note "全部一致。" || note "存在不一致（见上）。"
+  return "$bad"
+}
+
+# ------------------------------------------------ 关联 / 状态 / 上下文 / 回收
+
+sid_now() { session_id_now; }
+
+pick_project() { # <slug> [project] → 选定工程名（缺省取第一个）
+  local slug=$1 want=${2:-}
+  if [ -n "$want" ]; then printf '%s\n' "$want"; return 0; fi
+  feature_projects "$slug" | head -1
+}
+
+resolve_wt() { # <slug> <project> → worktree 路径；不满足条件返回非 0
+  # ⚠️ 这个函数**不能 die**：它被 $(...) 调用，命令替换是子壳，里面的 exit 只结束子壳，
+  # 父壳会带着空值继续跑（实测：attach 不存在的特性 → wt 空却继续 → journal_add 的
+  # mkdir -p 造出幽灵特性目录、还写了 .active）。所以只返回非 0，由调用方校验。
+  local slug=$1 proj=$2 wt
+  [ -f "$FEATURES_ROOT/$slug/feature.json" ] || return 1
+  [ -n "$proj" ] || return 1
+  wt=$(feature_wt_path "$slug" "$proj")
+  [ -n "$wt" ] || return 1
+  printf '%s\n' "$wt"
+}
+
+cmd_attach() {
+  local slug=${1:-} proj=${2:-} sid
+  [ "${FEATURE_NO_ATTACH:-0}" = "1" ] && return 0   # orchestrator.prepare 用：只建树，不绑调用者会话
+  [ -n "$slug" ] || die "用法：feature attach <特性名> [工程名]"
+  [ -f "$FEATURES_ROOT/$slug/feature.json" ] \
+    || die "没有这个特性：$slug（feature list 看候选；feature new 新建）"
+  if feature_is_recycled "$slug"; then
+    local rp rw rt
+    rp=$(pick_project "$slug" "$proj"); rw=$(feature_wt_path "$slug" "$rp"); rt=$(retired_target "$slug" "$rp")
+    die "特性 $slug 已回收，不能关联（$(feature_json "$slug" | jq -r '.recycledAt // "?"')，合并提交 $(feature_json "$slug" | jq -r '.mergeCommit // "?"')）
+  它的代码已在主干的 main 里；已回收特性不再是「在用的 worktree」。
+  · 旧路径现在只是路标（可读）：$rw → $rt
+  · 看它做过什么：feature context $slug
+  · 要接着改代码：feature new <新特性名> --repos $(feature_projects "$slug" | tr '\n' ',' | sed 's/,$//')"
+  fi
+  proj=$(pick_project "$slug" "$proj")
+  [ -n "$proj" ] || die "特性 $slug 没有登记任何工程"
+  local wt; wt=$(resolve_wt "$slug" "$proj") \
+    || die "特性 $slug 里没有工程 $proj（有：$(feature_projects "$slug" | tr '\n' ' '))"
+  sid=$(sid_now)
+  [ -n "$sid" ] || die "拿不到 DSH_SESSION_ID —— 本命令要在 dsh 会话里跑"
+  bind_session "$sid" "$slug" "$proj" "$wt" || die "绑定失败（注册表不可写？）"
+  printf '%s\n' "$slug" > "$ACTIVE_FILE" 2>/dev/null || true   # 兜底/展示用，不再是判据
+  journal_add "$slug" "会话 $sid 关联到 $wt" || true
+  note "已关联：本会话 $sid → 特性 $slug / 工程 $proj"
+  note "  worktree：$wt"
+  note "  接下来在该目录里干活：cd $wt && <命令>   （或把会话工作区建在那里）"
+}
+
+cmd_detach() {
+  local sid cur; sid=$(sid_now)
+  [ -n "$sid" ] || die "拿不到 DSH_SESSION_ID"
+  cur=$(session_feature "$sid" 2>/dev/null || true)
+  unbind_session "$sid"
+  if [ -n "$cur" ]; then journal_add "$cur" "会话 $sid 解除关联"; note "已解除关联（原：$cur）"; else note "本来就没有关联"; fi
+}
+
+cmd_switch() {
+  local slug=${1:-} proj=${2:-} sid old
+  [ -n "$slug" ] || die "用法：feature switch <特性名> [工程名]"
+  sid=$(sid_now); [ -n "$sid" ] || die "拿不到 DSH_SESSION_ID"
+  old=$(session_feature "$sid" 2>/dev/null || true)
+  if [ "$old" = "$slug" ]; then note "本会话已关联 $slug"; return 0; fi
+  if [ -n "$old" ]; then unbind_session "$sid"; journal_add "$old" "会话 $sid 切走（→ $slug）"; note "已解除旧关联：$old"; fi
+  cmd_attach "$slug" "$proj"
+}
+
+cmd_status() {
+  local sid bound via="" r; sid=$(sid_now)
+  note "会话：${sid:-<拿不到 DSH_SESSION_ID>}"
+  note "工作目录：$PWD"
+  bound=$(session_feature "$sid" 2>/dev/null || true)
+  if [ -n "$bound" ]; then
+    local p w; p=$(session_project "$sid"); w=$(session_worktree "$sid")
+    if feature_is_recycled "$bound"; then
+      # 回收时会 unbind，走到这里说明是回收前留下的绑定文件（或手工编辑过）——不是错误，但要讲清楚
+      note "关联（显式绑定）：$bound  ⚠ 该特性已回收 —— 这条绑定已是历史残留，建议 feature detach"
+      note "  旧路径路标：$w$([ -L "$w" ] && echo " → $(retired_target "$bound" "$p")（可读；写到那里会被守卫拦下）" || echo "（没有路标）")"
+    else
+      note "关联（显式绑定）：$bound"
+      note "  工程：$p"
+      note "  worktree：$w$([ -d "$w" ] || echo '  ⚠ 不存在（是否已回收？）')"
+      [ -d "$w" ] && note "  状态：$(wt_status "$(feature_repo_path "$bound" "$p")" "$w")"
+    fi
+  else
+    note "关联：无 —— 用 feature attach <特性名> 关联；或把会话工作区建在 worktree 目录里（位置即归属）"
+  fi
+  if r=$(feature_of_path "$PWD" 2>/dev/null); then
+    note "位置判定：cwd 就在 $r 的 worktree 内"
+  elif r=$(retired_feature_of_path "$PWD" 2>/dev/null); then
+    note "位置判定：cwd 在**已回收**特性 $r 的路标里（→ $(retired_target "$r" "$(pick_project "$r")")）"
+    note "  · 文件可读（路标解析到主检出）；这不是 worktree，写入会被 feature-guard 拦下"
+    note "  · 要接着改代码：feature new <新特性名> --repos $(feature_projects "$r" | tr '\n' ',' | sed 's/,$//')"
+  fi
+  note "兜底 .active：$(active_slug || true)"
+  [ -n "$bound" ] || feature_of_path "$PWD" >/dev/null 2>&1
+}
+
+cmd_context() {
+  local slug=${1:-} full=0
+  [ "${2:-}" = "--full" ] && full=1
+  if [ -z "$slug" ]; then
+    local sid; sid=$(sid_now)
+    slug=$(session_feature "$sid" 2>/dev/null || true)
+    [ -n "$slug" ] || slug=$(feature_of_path "$PWD" 2>/dev/null || true)
+    [ -n "$slug" ] || die "推断不出特性；用法：feature context <特性名>"
+  fi
+  [ -f "$FEATURES_ROOT/$slug/feature.json" ] || die "没有这个特性：$slug"
+  local proj repo wt br st; st=$(feature_status "$slug")
+  echo "== 特性 $slug =="
+  note "标题：$(feature_title "$slug")"
+  note "创建：$(feature_json "$slug" | jq -r '.created // "?"')   状态：$st"
+  [ "$st" = recycled ] && note "回收于：$(feature_json "$slug" | jq -r '.recycledAt // "?"')   合并提交：$(feature_json "$slug" | jq -r '.mergeCommit // "?"')"
+  note "关联会话：$(sessions_of_feature "$slug" | tr '\n' ' ')"
+  while IFS= read -r proj; do
+    [ -n "$proj" ] || continue
+    repo=$(feature_repo_path "$slug" "$proj"); wt=$(feature_wt_path "$slug" "$proj"); br=$(feature_branch "$slug" "$proj")
+    echo
+    echo "== 工程 $proj =="
+    if [ "$st" = recycled ]; then
+      # 已回收：worktree 已拆，原地是路标。这里**不报「缺失」**——那是设计如此，不是故障。
+      if [ -L "$wt" ]; then
+        note "旧路径路标：$wt → $(retired_target "$slug" "$proj")"
+        note "  · 可读（内容 = 该主检出的当前状态；特性代码已在主干里）；写入会被 feature-guard 拦下"
+      else
+        note "旧路径：$wt（无路标：回收时用了 --no-redirect / --keep-worktree，或已被 feature prune）"
+      fi
+      note "分支：$br（回收时未删则仍在；内容是主干的祖先）"
+      continue
+    fi
+    note "worktree：$wt"
+    note "分支：$br   状态：$(wt_status "$repo" "$wt")"
+    if [ -d "$wt" ]; then
+      local n base; base=$(repo_base_branch "$repo")
+      n=$(gitr -C "$wt" rev-list --count "$base..HEAD" 2>/dev/null || echo 0)
+      note "相对 $base 的提交（$n 条，最多列 10）："
+      [ "$n" = 0 ] && note "    （还没有提交——工作可能全在未提交改动里）" || gitr -C "$wt" log --oneline "$base..HEAD" 2>/dev/null | head -10 | sed 's/^/    /'
+      note "相对 $base 的改动规模：$(gitr -C "$wt" diff --stat "$base...HEAD" 2>/dev/null | tail -1 | sed 's/^ *//')"
+      note "未提交改动（最多 10）："
+      gitr -C "$wt" status --porcelain 2>/dev/null | head -10 | sed 's/^/    /'
+      if [ "$full" = 1 ]; then
+        note "全部提交："; gitr -C "$wt" log --oneline -20 2>/dev/null | sed 's/^/    /'
+        note "分支点：$(gitr -C "$wt" merge-base "$(repo_base_branch "$repo")" HEAD 2>/dev/null | cut -c1-12)"
+      fi
+      [ -f "$wt/.devloop/autosave.log" ] && { note "最近自动存档："; tail -3 "$wt/.devloop/autosave.log" | sed 's/^/    /'; }
+    else
+      note "⚠ worktree 不存在（可能已回收；feature list --all 看状态）"
+    fi
+  done < <(feature_projects "$slug")
+  echo
+  echo "== 这个 worktree 干了什么（工作日志）=="
+  journal_tail "$slug" 15 | sed 's/^/  /'
+  echo
+  echo "== 相关笔记与看板 =="
+  local nd
+  for nd in ${OFFHOURS_NOTES_DIRS:-}; do
+    [ -d "$nd" ] && grep -rl "$slug" "$nd" 2>/dev/null | head -5 | sed 's/^/  笔记：/'
+  done
+  local boards=${NIGHTSHIFT_BOARDS:-}
+  local b
+  for b in $boards; do
+    [ -f "$b" ] && jq -r --arg s "$slug" '.cards[] | select(.title|test($s)) | "  看板：[\(.status)] \(.title)"' "$b" 2>/dev/null | head -5
+  done
+  return 0
+}
+
+cmd_journal() {
+  local slug=${1:-}; shift || true
+  local text="$*"
+  [ -n "$slug" ] && [ -n "$text" ] || die "用法：feature journal <特性名> \"<一句话>\""
+  [ -f "$FEATURES_ROOT/$slug/feature.json" ] || die "没有这个特性：$slug"
+  journal_add "$slug" "${DSH_SESSION_ID:+[$DSH_SESSION_ID] }$text"
+  note "已记入 $(journal_file "$slug")"
+}
+
+cmd_resume() {
+  local slug=${1:-} proj=${2:-}
+  [ -n "$slug" ] || die "用法：feature resume <特性名> [工程名]"
+  [ -f "$FEATURES_ROOT/$slug/feature.json" ] || die "没有这个特性：$slug"
+  # 已回收：只打印上下文（给人做考古用），**不建立关联**——那里没有 worktree 可干活
+  if feature_is_recycled "$slug"; then
+    note "特性 $slug 已回收——只打印上下文，不建立关联（已回收的路径是只读路标）。"
+    echo
+    cmd_context "$slug"
+    return 0
+  fi
+  cmd_attach "$slug" "$proj"
+  echo
+  cmd_context "$slug"
+}
+
+cmd_recycle() {
+  local slug=${1:-}; shift || true
+  local yes=0 push=0 delbr=0 keepwt=0 redirect=1
+  while [ $# -gt 0 ]; do case "$1" in
+    --yes) yes=1; shift ;; --push) push=1; shift ;;
+    --delete-branch) delbr=1; shift ;; --keep-worktree) keepwt=1; shift ;;
+    --no-redirect) redirect=0; shift ;;
+    *) shift ;;
+  esac; done
+  [ -n "$slug" ] || die "用法：feature recycle <特性名> [--yes] [--push] [--delete-branch] [--keep-worktree] [--no-redirect]"
+  [ -f "$FEATURES_ROOT/$slug/feature.json" ] || die "没有这个特性：$slug"
+  [ "$(feature_json "$slug" | jq -r '.status // "active"')" = "recycled" ] && die "该特性已回收过"
+
+  local proj repo wt br problems=0
+  echo "== 回收计划：$slug =="
+  while IFS= read -r proj; do
+    [ -n "$proj" ] || continue
+    repo=$(feature_repo_path "$slug" "$proj"); wt=$(feature_wt_path "$slug" "$proj"); br=$(feature_branch "$slug" "$proj")
+    local dw dr cur ahe
+    dw=$(gitr -C "$wt" status --porcelain 2>/dev/null | wc -l)
+    cur=$(gitr -C "$repo" branch --show-current 2>/dev/null)
+    dr=$(gitr -C "$repo" status --porcelain 2>/dev/null | wc -l)
+    local base remote; base=$(feature_base_branch "$proj"); remote=$(feature_remote "$proj")
+    ahe=$(gitr -C "$wt" rev-list --count "$base..$br" 2>/dev/null || echo '?')
+    echo "  工程 $proj：$br → $base"
+    echo "    worktree $wt（未提交 $dw）"
+    echo "    主检出 $repo（当前分支 $cur，未提交 $dr）"
+    echo "    待合并提交：$ahe"
+    [ "$dw" != 0 ] && { echo "    ✗ worktree 有未提交改动——先提交（autosave 或 git commit）"; problems=1; }
+    [ "$dr" != 0 ] && { echo "    ✗ 主检出不干净——先处理"; problems=1; }
+    [ "$ahe" = 0 ] && echo "    ⚠ 无待合并提交（合并将是空操作）"
+  done < <(feature_projects "$slug")
+  echo "  动作：主检出切基准分支 → git merge --no-ff <分支>"
+  [ "$push" = 1 ] && echo "        → push <remote> <base>" || echo "        → 不推主干（要推加 --push）"
+  if [ "$keepwt" = 0 ]; then
+    if [ "$redirect" = 1 ]; then
+      echo "        → 移除 worktree，并在原地留**路标**（→ 主检出）：旧会话引用过的路径仍可读"
+    else
+      echo "        → 移除 worktree（--no-redirect：不留路标，旧路径将不可访问）"
+    fi
+  fi
+  [ "$delbr" = 1 ] && echo "        → 删除分支"
+  echo "        → 标记 status=recycled + 记日志 + 解除相关会话关联"
+  [ "$problems" = 1 ] && die "预检未通过，未执行任何动作"
+  [ "$yes" = 1 ] || { note ""; note "（未加 --yes，仅打印计划，未动手）"; return 0; }
+
+  local merged=() merge_sha=""
+  while IFS= read -r proj; do
+    [ -n "$proj" ] || continue
+    repo=$(feature_repo_path "$slug" "$proj"); wt=$(feature_wt_path "$slug" "$proj"); br=$(feature_branch "$slug" "$proj")
+    local base remote; base=$(feature_base_branch "$proj"); remote=$(feature_remote "$proj")
+    note "→ [$proj] checkout $base @ $repo"
+    gitr -C "$repo" checkout "$base" >/dev/null 2>&1 || die "切 $base 失败：$repo"
+    if [ "$(gitr -C "$repo" rev-list --count "$base..$br" 2>/dev/null || echo 0)" = 0 ]; then
+      note "  无待合并提交，跳过合并"
+    elif mapfile -t _id < <(git_identity_args "$repo"); gitr -C "$repo" "${_id[@]}" merge --no-ff "$br" -m "feat($slug): 合并特性分支（worker 回收）" >/dev/null 2>&1; then
+      merge_sha=$(gitr -C "$repo" rev-parse --short HEAD); note "  已合并 → $merge_sha"
+    else
+      gitr -C "$repo" merge --abort >/dev/null 2>&1 || true
+      die "合并冲突，已 abort：$repo（人工解决后重跑，或先在该 worktree 里 rebase $base）"
+    fi
+    if [ "$push" = 1 ]; then
+      gitr -C "$repo" push "$remote" "$base" >/dev/null 2>&1 && note "  已推 $remote $base" || note "  ⚠ 推 $remote $base 失败（远端名/权限）"
+    fi
+    if [ "$keepwt" = 0 ] && [ -d "$wt" ] && [ ! -L "$wt" ]; then
+      if gitr -C "$repo" worktree remove "$wt" 2>/dev/null; then
+        note "  已移除 worktree $wt"
+        # 回收的语义是「搬家」，不是「销毁」：原路径留一个指向主检出的符号链接，
+        # 让长命会话里引用过的绝对路径继续可读（用户 2026-10-15 现场提出的问题）。
+        if [ "$redirect" = 1 ]; then
+          mkdir -p "$FEATURES_ROOT/$slug"
+          if ln -sfn "$repo" "$wt"; then
+            note "  已留路标：$wt → $repo（旧会话里的 @路径 仍可读；写到那里会被守卫拦下）"
+          else
+            note "  ⚠ 留路标失败（$wt）：旧路径引用将不可访问"
+          fi
+        fi
+      else
+        note "  ⚠ 移除 worktree 失败（用 --keep-worktree 保留）"
+      fi
+    fi
+    if [ "$delbr" = 1 ]; then
+      gitr -C "$repo" branch -d "$br" >/dev/null 2>&1 && note "  已删除分支 $br" || note "  ⚠ 分支未删：$br"
+    fi
+    merged+=("$proj")
+  done < <(feature_projects "$slug")
+
+  local tmp; tmp=$(mktemp)
+  jq --arg t "$(date -Is)" --arg c "${merge_sha:-}" \
+     '.status="recycled" | .recycledAt=$t | .mergeCommit=$c' \
+     "$FEATURES_ROOT/$slug/feature.json" > "$tmp" && mv "$tmp" "$FEATURES_ROOT/$slug/feature.json"
+
+  # 路标记账：符号链接是磁盘事实，retiredTo 是注册表事实——两边都记，这样
+  # feature list/context/doctor/prune 不必靠「路径长没长成链接」去猜。
+  local nredir=0
+  if [ "$keepwt" = 0 ] && [ "$redirect" = 1 ]; then
+    local p2 w2 t2 tmp2
+    for p2 in $(feature_projects "$slug"); do
+      w2=$(feature_wt_path "$slug" "$p2"); [ -L "$w2" ] || continue
+      t2=$(readlink -f "$w2" 2>/dev/null || true); [ -n "$t2" ] || continue
+      nredir=$((nredir+1))
+      tmp2=$(mktemp)
+      jq --arg p "$p2" --arg r "$t2" --arg t "$(date -Is)" \
+         '.repos[$p].retiredTo=$r | .repos[$p].retiredAt=$t' \
+         "$FEATURES_ROOT/$slug/feature.json" > "$tmp2" && mv "$tmp2" "$FEATURES_ROOT/$slug/feature.json"
+    done
+    # 只在**确实**留下了路标时才写说明（worktree remove 失败时不能撒谎说旧路径可读）
+    if [ "$nredir" -gt 0 ]; then
+      {
+        printf '# 已回收特性：%s\n\n' "$slug"
+        printf '回收时间：%s\n合并提交：%s\n\n' "$(date -Is)" "${merge_sha:-（无待合并提交）}"
+        printf '这个特性的代码已经合进主干的 main。worktree 已拆除，但旧路径留了指向**主检出**的\n'
+        printf '符号链接（路标）——会话里引用过的绝对路径仍然可读，内容 = 主检出的当前状态：\n\n'
+        for p2 in $(feature_projects "$slug"); do
+          w2=$(feature_wt_path "$slug" "$p2")
+          [ -L "$w2" ] && printf -- '- `%s` → `%s`\n' "$w2" "$(readlink -f "$w2")"
+        done
+        printf '\n路标**只保证读**：往这些路径写或提交会被 `feature-guard` 拦下（git 会把它解析回主检出），\n'
+        printf '所以它不会变成绕过制度的口子。要接着改代码：`feature new <新特性名> --repos <工程名>`。\n'
+        printf '确定不再需要这些旧路径时：`feature prune %s --yes`（只删符号链接；加 --purge 连记录一起清）。\n' "$slug"
+      } > "$FEATURES_ROOT/$slug/REDIRECT.md"
+    fi
+  fi
+
+  journal_add "$slug" "回收完成：合并到 ${merged[*]} 的基准分支（merge ${merge_sha:-无}）$([ "$push" = 1 ] && echo '，已推远端')$([ "$keepwt" = 0 ] && [ "$redirect" = 1 ] && echo '；worktree 已拆，旧路径留路标（只读）')"
+  local sid
+  for sid in $(sessions_of_feature "$slug"); do unbind_session "$sid"; note "  已解除会话关联：$sid"; done
+  [ "$(active_slug)" = "$slug" ] && rm -f "$ACTIVE_FILE"
+  note ""
+  note "特性已回收：$slug（注册记录保留，status=recycled；feature list --all 可查）"
+  if [ "$keepwt" = 0 ] && [ "$redirect" = 1 ] && [ "$nredir" -gt 0 ]; then
+    note "· 旧路径仍可读（那是通往主检出的路标）：$FEATURES_ROOT/$slug/REDIRECT.md"
+    note "· 旧会话里引用过的 worktree 路径不会变成死链；但往那里写会被 feature-guard 拦下"
+    note "· 不再需要这些旧路径时：feature prune $slug --yes"
+  elif [ "$keepwt" = 0 ] && [ "$redirect" = 1 ]; then
+    note "· ⚠ 没有留下任何路标（worktree 未成功移除？）：旧会话引用过的路径可能已失联"
+  elif [ "$keepwt" = 0 ]; then
+    note "· ⚠ 未留路标（--no-redirect）：旧会话引用过的 worktree 路径现在是死链"
+  fi
+}
+
+# ------------------------------------------------ 未值守可用性：按需建 + 权限预检
+
+# ensure：幂等的「按需创建」入口。会话（尤其未值守的跑批）只该调这一条：
+#   特性在 → 核对 worktree 都在、把本会话关联上；特性不在 → 建（feature new）。
+# 为什么单独做一条而不是让人自己判断 new/attach：未值守会话无法提问，一个确定性
+# 命令 + 明确的失败信息，比让它在不确定的分支上猜更省 token、也更安全。
+cmd_ensure() {
+  local slug=${1:-}; shift || true
+  local repos="" title=""
+  while [ $# -gt 0 ]; do case "$1" in
+    --repos) repos=${2:-}; shift 2 ;;
+    --title) title=${2:-}; shift 2 ;;
+    -*) die "未知参数：$1" ;;
+    *) shift ;;
+  esac; done
+  [ -n "$slug" ] || die "用法：feature ensure <特性名> --repos <工程名,...> [--title ...]"
+
+  if [ ! -f "$FEATURES_ROOT/$slug/feature.json" ]; then
+    [ -n "$repos" ] || die "特性 $slug 不存在；要新建需要 --repos <工程名,...>（feature repo list 看工程名）"
+    if [ -n "$title" ]; then cmd_new "$slug" --repos "$repos" --title "$title"
+    else cmd_new "$slug" --repos "$repos"; fi
+    return 0
+  fi
+
+  feature_is_recycled "$slug" && die "特性 $slug 已回收，这个名字不能再用于新工作——请换名：feature new <新名字> --repos ${repos:-$(feature_projects "$slug" | tr '\n' ',' | sed 's/,$//')}（清理旧记录：feature prune $slug --purge）"
+
+  local p wt bad=0
+  for p in $(feature_projects "$slug"); do
+    wt=$(feature_wt_path "$slug" "$p")
+    if [ -d "$wt" ] && [ ! -L "$wt" ]; then
+      note "✓ 已就绪：$slug/$p → $wt"
+    else
+      note "✗ $slug/$p 的 worktree 缺失或不是真实目录：$wt"; bad=1
+    fi
+  done
+  if [ "$bad" = 1 ]; then
+    # 刻意不自动重建：缺失可能是「已回收」「被 close」「有人手工删了」，重建会把历史抹掉
+    die "特性 $slug 的 worktree 不完整——先 feature context $slug 看清状态（已回收的旧路径是只读路标），不要在这里重建"
+  fi
+
+  local sid; sid=$(session_id_now)
+  if [ -z "$sid" ]; then note "（拿不到 DSH_SESSION_ID，跳过关联：把会话工作区建在 worktree 里也等于关联）"
+  elif [ "$(session_feature "$sid" 2>/dev/null || true)" = "$slug" ]; then note "本会话已关联 $slug"
+  else cmd_attach "$slug"; fi
+}
+
+# preflight：在**不需要任何人批准**的前提下，验证「现在这个会话能不能按需建 worktree」。
+#
+# 为什么要有它（用户 2026-10-15 现场）：建 worktree 要写两处**都在会话工作区之外**的地方
+# ——特性根 $FEATURES_ROOT/** 与仓库 git 元数据 <repo>/.git/worktrees/**（连 worktree 里的
+# git commit 也是写共享 git 目录）。而 DSH 的文件沙箱在 workspace-write 下只放行「工作区根
+# + /tmp」，且 dsh-sandbox-policy 没有额外可写路径白名单 ⇒ 这个工作流与该模式结构性冲突；
+# 未值守会话又无法批准提权（本机 approval 直接拒绝），于是「到跑批时才发现要审批」。
+# 结论落在部署层（systemd drop-in: Environment=DSH_PERMISSION_MODE=danger-full-access，
+# 边界交给 feature-guard 钩子），而这个命令把结论变成**可执行的体检**：谁都能在开工前
+# （或跑批第 0 步）跑一次，失败立刻暴露并给出确切修法。
+cmd_preflight() {
+  local repos_arg="" quiet=0
+  while [ $# -gt 0 ]; do case "$1" in
+    --repos) repos_arg=${2:-}; shift 2 ;;
+    --quiet) quiet=1; shift ;;
+    -*) die "未知参数：$1" ;;
+    *) shift ;;
+  esac; done
+  say() { [ "$quiet" = 1 ] || printf '%s\n' "$*"; }
+  local bad=0 root_ok=0
+
+  # 1) 特性根目录可写（真写探针；沙箱拒绝与 unix 权限问题都在这里现形）
+  ensure_root 2>/dev/null
+  local probe="$FEATURES_ROOT/.preflight-$$"
+  if mkdir -p "$probe" 2>/dev/null && : > "$probe/probe" 2>/dev/null; then
+    root_ok=1; say "✓ 特性根可写：$FEATURES_ROOT"
+  else
+    say "✗ 特性根**不可写**：$FEATURES_ROOT"
+    say "  这是文件沙箱在工作，不是 unix 权限（本机所有会话都跑在 root 下）。"
+    say "  workspace-write 只放行「会话工作区根 + /tmp」，而 worktree 必须写到工作区之外。"
+    bad=1
+  fi
+  rm -rf "$probe" 2>/dev/null
+
+  # 2) 每个登记工程：git 元数据目录可写 + 真跑一次 git worktree add/remove
+  local -a plist=()
+  if [ -n "$repos_arg" ]; then IFS=',' read -r -a plist <<< "$repos_arg"
+  elif [ -f "$REPOS_FILE" ]; then mapfile -t plist < <(jq -r 'keys[]' "$REPOS_FILE" 2>/dev/null); fi
+  local p repo gd tw
+  for p in ${plist[@]+"${plist[@]}"}; do
+    [ -n "$p" ] || continue
+    repo=$(repo_path_for "$p")
+    if [ -z "$repo" ]; then
+      say "✗ $p：工程未登记（先在配置 repos 或 feature repo add 里登记主检出路径）"; bad=1; continue
+    fi
+    if ! gd=$(gitr -C "$repo" rev-parse --absolute-git-dir 2>/dev/null); then
+      say "✗ $p：不是 git 仓库或不可读：$repo"; bad=1; continue
+    fi
+    if : > "$gd/.feature-preflight-$$" 2>/dev/null; then
+      rm -f "$gd/.feature-preflight-$$"; say "✓ $p：git 元数据目录可写（$gd）"
+    else
+      say "✗ $p：git 元数据目录**不可写**（$gd）——git worktree add 必然失败"; bad=1
+    fi
+    if [ "$root_ok" = 1 ]; then
+      tw="$FEATURES_ROOT/.preflight/$$-$p"
+      if mkdir -p "$(dirname "$tw")" 2>/dev/null \
+         && gitr -C "$repo" worktree add --no-checkout --detach "$tw" HEAD >/dev/null 2>&1; then
+        if gitr -C "$repo" worktree remove --force "$tw" >/dev/null 2>&1; then
+          say "✓ $p：git worktree add/remove 实跑通过（--no-checkout，不留痕迹）"
+        else
+          say "✗ $p：worktree add 成功但 remove 失败——请手工 git worktree prune（$repo）"; bad=1
+        fi
+      else
+        say "✗ $p：git worktree add 实跑失败（目标 $tw）"; bad=1
+      fi
+      gitr -C "$repo" worktree prune >/dev/null 2>&1 || true
+    fi
+  done
+
+  if [ "$bad" = 0 ]; then
+    say ""
+    say "预检通过：本会话可以在**不请求任何批准**的前提下按需创建 worktree（feature ensure / feature new）。"
+    return 0
+  fi
+  say ""
+  say "预检未通过——未值守时这就会变成「跑批到一半卡住」：
+  · 部署层修法（一次修好所有会话，需重启 dsh-web）：
+      /etc/systemd/system/dsh-web.service.d/30-permission-mode.conf
+        [Service]
+        Environment=DSH_PERMISSION_MODE=danger-full-access
+      （dsh-base 用它同时决定沙箱模式与 approval：danger-full-access ⇒ approval never。
+        边界改由 feature-guard 钩子承担：写与提交只能落在特性 worktree 里。）
+  · 单会话修法：在 GUI 把这个会话的权限切到 danger-full-access，然后重跑本预检。
+  · 为什么不能更窄：workspace-write 只放行会话工作区 + /tmp，而 worktree 要写特性根与
+    仓库 .git；dsh-sandbox-policy 没有额外可写路径白名单（只有 mode/workspaceRoot）。"
+  return 1
+}
+
+# ------------------------------------------------ 清理：路标与墓碑
+
+# prune 是「回收」的收尾动作（2026-10-15）。recycle 刻意在旧路径留下指向主检出的路标，
+# 让长命会话里的引用不至于变成死链；但路标不该永远在——不再需要时用它清掉。
+# **安全性是这里的头等事**：只删符号链接，绝不 rm 真实目录（否则一条手滑的命令就能删掉主检出）。
+cmd_prune() {
+  local slug="" purge=0 yes=0 all=0
+  while [ $# -gt 0 ]; do case "$1" in
+    --purge) purge=1; shift ;;
+    --yes) yes=1; shift ;;
+    --all) all=1; shift ;;
+    -*) die "未知参数：$1" ;;
+    *) slug=$1; shift ;;
+  esac; done
+  [ -n "$slug" ] || [ "$all" = 1 ] || die "用法：feature prune <特性名> [--purge] [--yes]   /   feature prune --all [--purge] [--yes]"
+
+  local -a targets=() t
+  if [ "$all" = 1 ]; then
+    for t in $(feature_slugs_recycled); do targets+=("$t"); done
+    for t in "$FEATURES_ROOT"/*/; do
+      [ -d "$t" ] || continue
+      t=$(basename "$t")
+      [ -f "$FEATURES_ROOT/$t/feature.json" ] && continue
+      [ -e "$FEATURES_ROOT/$t/CLOSED.md" ] && targets+=("$t")
+    done
+  else
+    [ -e "$FEATURES_ROOT/$slug" ] || die "没有这个特性/目录：$slug"
+    targets=("$slug")
+  fi
+  [ "${#targets[@]}" -gt 0 ] || { note "没有需要清理的已回收特性。"; return 0; }
+
+  local problems=0 proj wt
+  echo "== 清理计划 =="
+  for t in "${targets[@]}"; do
+    if [ -f "$FEATURES_ROOT/$t/feature.json" ] && ! feature_is_recycled "$t"; then
+      echo "  ✗ $t：仍在用（status=$(feature_status "$t")）——先用 recycle 收口或 close 放弃"; problems=1; continue
+    fi
+    [ -f "$FEATURES_ROOT/$t/feature.json" ] || echo "  墓碑 $t：只有 CLOSED.md（无注册记录）"
+    while IFS= read -r proj; do
+      [ -n "$proj" ] || continue
+      wt=$(feature_wt_path "$t" "$proj"); [ -n "$wt" ] || continue
+      if [ -L "$wt" ]; then
+        echo "  路标 $wt → $(readlink -f "$wt" 2>/dev/null)（只删这个链接，主检出不动）"
+      elif [ -d "$wt" ]; then
+        echo "  ✗ $wt 是**真实目录**，不是路标——不动它（先确认它是不是谁的 worktree：feature audit）"
+        problems=1
+      else
+        echo "  （$wt 已不存在）"
+      fi
+    done < <(feature_projects "$t")
+    [ "$purge" = 1 ] && echo "  记录 $t：清 feature.json / CLOSED.md / REDIRECT.md（journal.md 保留为历史）"
+  done
+
+  # 自保：别把本会话脚下的路径拆掉（拆了之后这个会话的 cwd 就没了）
+  local here; here=$(retired_feature_of_path "$PWD" 2>/dev/null || true)
+  if [ -n "$here" ]; then
+    for t in "${targets[@]}"; do
+      [ "$t" = "$here" ] && die "本会话 cwd 就在 $here 的路标里（$PWD）——先切到别处再清理"
+    done
+  fi
+  [ "$problems" = 1 ] && die "预检未通过，未执行任何动作"
+  [ "$yes" = 1 ] || { note ""; note "（未加 --yes，仅打印计划，未动手）"; return 0; }
+
+  local stamp; stamp=$(date +%Y%m%d-%H%M%S)
+  for t in "${targets[@]}"; do
+    while IFS= read -r proj; do
+      [ -n "$proj" ] || continue
+      wt=$(feature_wt_path "$t" "$proj")
+      if [ -n "$wt" ] && [ -L "$wt" ]; then
+        local tg; tg=$(readlink -f "$wt" 2>/dev/null || echo '?')
+        rm -f "$wt" && note "  已移除路标：$wt（只删了符号链接；$tg 未被动过）"
+      fi
+    done < <(feature_projects "$t")
+    if [ "$purge" = 1 ]; then
+      if [ -f "$FEATURES_ROOT/$t/journal.md" ]; then
+        mv "$FEATURES_ROOT/$t/journal.md" "$FEATURES_ROOT/$t.history-$stamp.md" \
+          && note "  journal 保留为历史：$FEATURES_ROOT/$t.history-$stamp.md"
+      fi
+      rm -f "$FEATURES_ROOT/$t/feature.json" "$FEATURES_ROOT/$t/CLOSED.md" "$FEATURES_ROOT/$t/REDIRECT.md"
+      [ "$(active_slug)" = "$t" ] && rm -f "$ACTIVE_FILE"
+      rmdir "$FEATURES_ROOT/$t" 2>/dev/null && note "  已清除记录并删除空目录：$t" \
+        || note "  已清除记录：$t（目录里还有别的文件，未删：$FEATURES_ROOT/$t）"
+    else
+      note "  已清理路标：$t（注册记录保留；要连记录一起清加 --purge）"
+    fi
+  done
+}
+
+# relink：给**已回收**特性补/重建路标。存在的理由：路标是后加的（2026-10-15），
+# 之前回收的特性（facet-constitution / facet-contract 就是）旧路径已经是死链；
+# 或者路标被 feature prune / 手滑删掉，后来又需要考古。一条命令补回来，不用重新回收。
+cmd_relink() {
+  local all=0 yes=0 slug="" s
+  while [ $# -gt 0 ]; do case "$1" in
+    --all) all=1; shift ;; --yes) yes=1; shift ;; -*) die "未知参数：$1" ;; *) slug=$1; shift ;;
+  esac; done
+  [ -n "$slug" ] || [ "$all" = 1 ] || die "用法：feature relink <特性名> [--yes]   /   feature relink --all [--yes]"
+
+  local -a targets=()
+  if [ "$all" = 1 ]; then
+    for s in $(feature_slugs_recycled); do targets+=("$s"); done
+  else
+    [ -f "$FEATURES_ROOT/$slug/feature.json" ] || die "没有这个特性：$slug"
+    feature_is_recycled "$slug" || die "特性 $slug 还在用（status=$(feature_status "$slug")）——relink 只用于已回收特性"
+    targets=("$slug")
+  fi
+  [ "${#targets[@]}" -gt 0 ] || { note "没有已回收的特性，不需要补路标。"; return 0; }
+
+  local problems=0 t proj repo wt
+  echo "== 补路标计划 =="
+  for t in "${targets[@]}"; do
+    while IFS= read -r proj; do
+      [ -n "$proj" ] || continue
+      repo=$(feature_repo_path "$t" "$proj"); wt=$(feature_wt_path "$t" "$proj")
+      [ -n "$wt" ] || continue
+      if [ ! -d "$repo" ]; then echo "  ✗ $t/$proj：主检出不存在 $repo"; problems=1; continue; fi
+      if [ -L "$wt" ]; then
+        [ "$(readlink -f "$wt" 2>/dev/null)" = "$repo" ] \
+          && echo "  · $wt 已有正确路标 → $repo（跳过）" \
+          || echo "  → $wt 路标指向不对（$(readlink -f "$wt" 2>/dev/null)）→ 重建为 $repo"
+      elif [ -d "$wt" ]; then
+        echo "  ✗ $wt 是**真实目录**——不动它（先确认它不是谁的 worktree：feature audit）"; problems=1
+      else
+        echo "  → $wt → $repo（补上缺失的路标）"
+      fi
+    done < <(feature_projects "$t")
+  done
+  [ "$problems" = 1 ] && die "预检未通过，未执行任何动作"
+  [ "$yes" = 1 ] || { note ""; note "（未加 --yes，仅打印计划，未动手）"; return 0; }
+
+  local n=0
+  for t in "${targets[@]}"; do
+    while IFS= read -r proj; do
+      [ -n "$proj" ] || continue
+      repo=$(feature_repo_path "$t" "$proj"); wt=$(feature_wt_path "$t" "$proj")
+      [ -n "$wt" ] || continue
+      [ -d "$repo" ] || continue
+      if [ -L "$wt" ] && [ "$(readlink -f "$wt" 2>/dev/null)" = "$repo" ]; then continue; fi
+      [ -e "$wt" ] && continue          # 真实目录/别的文件：预检已排除，这里再兜一层
+      mkdir -p "$FEATURES_ROOT/$t"
+      if ln -sfn "$repo" "$wt"; then
+        n=$((n+1)); note "  ✓ 已补路标：$wt → $repo"
+        local tmp2; tmp2=$(mktemp)
+        jq --arg p "$proj" --arg r "$repo" --arg at "$(date -Is)" \
+           '.repos[$p].retiredTo=$r | .repos[$p].retiredAt=$at' \
+           "$FEATURES_ROOT/$t/feature.json" > "$tmp2" && mv "$tmp2" "$FEATURES_ROOT/$t/feature.json"
+      else
+        note "  ⚠ 补路标失败：$wt"
+      fi
+    done < <(feature_projects "$t")
+  done
+  note "补了 $n 个路标。旧路径现在可读（只读；写入会被 feature-guard 拦下）。"
+}
+
+# ------------------------------------------------ 工作状态审计 / 滞留改动营救
+
+cmd_audit() {
+  local repo proj slug br st dirty cur ahead behind remote_ref local_rev
+  echo "== 工程主检出 =="
+  local seen=""
+  while IFS= read -r proj; do
+    [ -n "$proj" ] || continue
+    case " $seen " in *" $proj "*) continue ;; esac
+    seen="$seen $proj"
+    repo=$(repo_path_for "$proj")
+    [ -e "$repo/.git" ] || { printf '  %-10s %s（不是 git 仓库）\n' "$proj" "$repo"; continue; }
+    cur=$(gitr -C "$repo" branch --show-current)
+    dirty=$(gitr -C "$repo" status --porcelain | wc -l)
+    printf '  %-10s %s\n' "$proj" "$repo"
+    if [ "$cur" = main ] || [ "$cur" = master ]; then
+      printf '    分支：%s ✓\n' "$cur"
+    else
+      printf '    分支：%s  ⚠ 主检出应停在 main（当前不是）\n' "$cur"
+    fi
+    if [ "$dirty" = 0 ]; then printf '    未提交：0 ✓\n'
+    else printf '    未提交：%s 项  ⚠ 主检出不承担开发工作——用 feature rescue <特性名> 搬进 worktree\n' "$dirty"; fi
+    # 本地 main 与远端
+    if gitr -C "$repo" rev-parse --verify --quiet refs/remotes/gitea/main >/dev/null; then
+      read -r ahead behind < <(gitr -C "$repo" rev-list --left-right --count main...gitea/main 2>/dev/null)
+      printf '    main vs gitea/main：领先 %s / 落后 %s%s\n' "$ahead" "$behind" \
+        "$([ "$ahead" != 0 ] && echo '  （未推送主干——按纪律由人决定）')"
+    fi
+  done < <(feature_slugs | while read -r s; do feature_projects "$s"; done | sort -u)
+
+  echo
+  echo "== 特性 worktree =="
+  printf '  %-26s %-8s %-30s %-18s %s\n' 特性 工程 分支 "工作区" "与 main"
+  for slug in $(feature_slugs); do
+    st=$(feature_json "$slug" | jq -r '.status // "active"')
+    [ "$st" = "recycled" ] && continue
+    while IFS= read -r proj; do
+      [ -n "$proj" ] || continue
+      repo=$(feature_repo_path "$slug" "$proj"); wt=$(feature_wt_path "$slug" "$proj"); br=$(feature_branch "$slug" "$proj")
+      if [ ! -d "$wt" ]; then printf '  %-26s %-8s %-30s %s\n' "$slug" "$proj" "$br" "⚠ worktree 缺失"; continue; fi
+      dirty=$(gitr -C "$wt" status --porcelain | wc -l)
+      # rev-list --left-right --count main...br：左=只在 main（落后）右=只在 br（领先）
+      read -r behind ahead < <(gitr -C "$wt" rev-list --left-right --count "main...$br" 2>/dev/null || echo '? ?')
+      remote_ref=""
+      if gitr -C "$repo" rev-parse --verify --quiet "refs/remotes/gitea/$br" >/dev/null; then
+        local_rev=$(gitr -C "$wt" rev-parse "$br" 2>/dev/null); remote_ref=$(gitr -C "$repo" rev-parse "gitea/$br" 2>/dev/null)
+        [ "$local_rev" = "$remote_ref" ] && remote_ref="已同步" || remote_ref="⚠ 未推送/不一致"
+      else remote_ref="未推送"; fi
+      printf '  %-26s %-8s %-30s %-18s 领先%s/落后%s  %s\n' "$slug" "$proj" "$br" \
+        "$([ "$dirty" = 0 ] && echo 干净 || echo "改动$dirty")" "${ahead:-?}" "${behind:-?}" "$remote_ref"
+    done < <(feature_projects "$slug")
+  done
+
+  echo
+  echo "== 可回收 / 已取代 =="
+  local any=0 superseded
+  for slug in $(feature_slugs); do
+    feature_is_recycled "$slug" && continue      # 已回收的不再进「可回收」建议
+    while IFS= read -r proj; do
+      [ -n "$proj" ] || continue
+      br=$(feature_branch "$slug" "$proj"); repo=$(feature_repo_path "$slug" "$proj")
+      [ -n "$br" ] || continue
+      # 先看是否已并入主干（Phase 0 那类：内容已在 main 里）——这比「被某特性取代」更强
+      if gitr -C "$repo" merge-base --is-ancestor "$br" main 2>/dev/null; then
+        printf '  %-26s 已并入 main → 可 feature recycle %s（或 close 只拆 worktree）\n' "$slug" "$slug"
+        any=1; continue
+      fi
+      for superseded in $(feature_slugs); do
+        [ "$superseded" = "$slug" ] && continue
+        local sbr; sbr=$(feature_branch "$superseded" "$proj")
+        [ -n "$sbr" ] || continue
+        if [ "$sbr" != "$br" ] && gitr -C "$repo" merge-base --is-ancestor "$br" "$sbr" 2>/dev/null; then
+          printf '  %-26s 已被 %s 取代（其提交是后者的祖先）→ 可 feature close %s\n' "$slug" "$superseded" "$slug"
+          any=1; break
+        fi
+      done
+    done < <(feature_projects "$slug")
+  done
+  [ "$any" = 0 ] && echo "  （没有可回收的）"
+  echo
+  echo "== 孤儿 worktree（注册表里已无对应特性）=="
+  local orphan=0 w
+  for w in "$FEATURES_ROOT"/*/*/; do
+    [ -d "$w" ] || continue
+    [ -e "$w/.git" ] || continue
+    slug=$(basename "$(dirname "$w")")
+    [ -f "$FEATURES_ROOT/$slug/feature.json" ] || { echo "  $w"; orphan=1; }
+  done
+  [ "$orphan" = 0 ] && echo "  （没有）"
+
+  echo
+  echo "== 已回收特性的路标（旧路径仍可读；不再需要时 feature prune）=="
+  local rl=0 rw
+  for slug in $(feature_slugs_recycled); do
+    while IFS= read -r proj; do
+      [ -n "$proj" ] || continue
+      rw=$(feature_wt_path "$slug" "$proj"); [ -n "$rw" ] || continue
+      if [ -L "$rw" ]; then printf '  %-26s %-8s %s → %s\n' "$slug" "$proj" "$rw" "$(readlink -f "$rw" 2>/dev/null)"; rl=1
+      elif [ -d "$rw" ]; then printf '  %-26s %-8s %s  ⚠ 真实目录（不是路标，未清理）\n' "$slug" "$proj" "$rw"; rl=1
+      fi
+    done < <(feature_projects "$slug")
+  done
+  [ "$rl" = 0 ] && echo "  （没有）"
+  return 0
+}
+
+cmd_rescue() { # 把主检出里滞留的未提交改动搬进某个特性的 worktree（stash → apply，stash 保留作备份）
+  local slug=${1:-}; shift || true
+  local proj="" dry=1
+  while [ $# -gt 0 ]; do case "$1" in
+    --project) proj=${2:-}; shift 2 ;;
+    --yes) dry=0; shift ;;
+    *) shift ;;
+  esac; done
+  [ -n "$slug" ] || die "用法：feature rescue <特性名> [--project 工程名] [--yes]（默认只打印计划）"
+  [ -f "$FEATURES_ROOT/$slug/feature.json" ] || die "没有这个特性：$slug"
+  feature_is_recycled "$slug" && die "特性 $slug 已回收——没有 worktree 可营救；要接着改代码请 feature new <新特性名> --repos <工程名>"
+  proj=$(pick_project "$slug" "$proj")
+  local repo wt; repo=$(feature_repo_path "$slug" "$proj"); wt=$(feature_wt_path "$slug" "$proj")
+  [ -n "$repo" ] && [ -n "$wt" ] || die "特性 $slug 里没有工程 $proj"
+  [ -d "$wt" ] || die "worktree 不存在：$wt"
+
+  local dirty_main dirty_wt
+  dirty_main=$(gitr -C "$repo" status --porcelain | wc -l)
+  dirty_wt=$(gitr -C "$wt" status --porcelain | wc -l)
+  echo "== 营救计划：主检出 → $slug/$proj =="
+  echo "  主检出 $repo（分支 $(gitr -C "$repo" branch --show-current)，未提交 $dirty_main 项）"
+  echo "  目标    $wt（分支 $(gitr -C "$wt" branch --show-current)，未提交 $dirty_wt 项）"
+  [ "$dirty_main" = 0 ] && { note "主检出没有未提交改动，不需要营救"; return 0; }
+  [ "$dirty_wt" != 0 ] && die "目标 worktree 不干净（$dirty_wt 项）——先把那边处理好，避免营救变成两堆改动打架"
+  echo "  动作：① 主检出 git stash push -u（把改动与未跟踪文件一起收进 stash）"
+  echo "        ② 目标 worktree git stash apply（stash 是仓库级的，跨 worktree 可用）"
+  echo "        ③ **保留 stash 作备份**，核实无误后由你 git stash drop"
+  [ "$dry" = 1 ] && { note ""; note "（未加 --yes，仅打印计划，未动手）"; return 0; }
+
+  local msg="feature-rescue:$slug:$(date +%Y%m%d-%H%M%S)"
+  gitr -C "$repo" stash push -u -m "$msg" >/dev/null 2>&1 || die "stash 失败（主检出没有可收的改动？）"
+  note "  ① 已收进 stash：$msg"
+  if gitr -C "$wt" stash apply "stash@{0}" >/dev/null 2>&1; then
+    note "  ② 已应用到 $wt"
+    journal_add "$slug" "营救：把主检出 $repo 的滞留改动搬进 $wt（stash: $msg）" || true
+    note ""
+    note "完成。改动现在在 $wt 的工作区里（未提交）。"
+    note "  · 下一步：feature context $slug 看上下文 → 再提交（autosave 或 git commit）"
+    note "  · 核实无误后清掉备份：git -C $repo stash drop"
+  else
+    gitr -C "$wt" reset --hard >/dev/null 2>&1 || true
+    die "apply 冲突，已把 worktree 复位；改动仍在 stash 里（$msg），请人工处理"
+  fi
+}
+
+# ------------------------------ sync：把父级最新代码合进本 worktree ------------------------------
+# 夜间跑批要求：每个要跑的任务都从最新主干出发；已有 worktree 的也要把父级的最新内容合进来。
+# 父级定义：worker 特性（ns-<卡片id前12位>）的父级 = 该卡"源会话"关联的特性；其余特性的父级 = main。
+# 级联方向：main → 源特性 → worker（先父后子）。只做 merge，绝不 rebase/force。
+sync_parent_of() {   # 打印某个特性的父级 slug；空表示父级是 main
+  local slug=$1
+  case "$slug" in
+    ns-*) : ;;
+    *) return 0 ;;
+  esac
+  case "$slug" in
+    ns-auto-*) return 0 ;;                      # 自动源特性：父级就是 main
+  esac
+  local cid12=${slug#ns-}                       # <卡片id前12位>
+  local boards=${NIGHTSHIFT_BOARDS:-}
+  local b sid=
+  for b in $boards; do
+    [ -f "$b" ] || continue
+    sid=$(jq -r --arg pre "card-$cid12" \
+      'first((.cards // [])[] | select(.id | startswith($pre)) | .sourceSessionId) // empty' "$b" 2>/dev/null)
+    [ -n "$sid" ] && break
+  done
+  [ -n "$sid" ] || return 0
+  local assoc="$FEATURES_ROOT/.sessions/$sid.json"
+  [ -f "$assoc" ] || return 0
+  local feat
+  feat=$(jq -r '.feature // empty' "$assoc" 2>/dev/null)
+  [ -n "$feat" ] || return 0
+  [ "$feat" = "$slug" ] && return 0             # 防御：自指
+  [ -f "$FEATURES_ROOT/$feat/feature.json" ] || return 0
+  [ "$(feature_json "$feat" | jq -r '.status // "active"')" = "recycled" ] && return 0
+  printf '%s\n' "$feat"
+}
+
+cmd_sync() {
+  local slug= check=0 from= target all=0
+  local a
+  for a in "$@"; do
+    case "$a" in
+      --check) check=1 ;;
+      --all) all=1 ;;
+      --from=*) from=${a#--from=} ;;
+      -*) ;;
+      *) [ -z "$slug" ] && slug=$a ;;
+    esac
+  done
+  if [ -z "$slug" ] || [ "$all" = 1 ]; then
+    all=1
+  else
+    [ -f "$FEATURES_ROOT/$slug/feature.json" ] || die "没有这个特性：$slug"
+  fi
+
+  # 同一把锁：与夜间跑批的 prep-worktree 串行化（避免并发改注册表/worktree 元数据）
+  exec 8>"$FEATURES_ROOT/.ns-feature.lock"
+  flock -x 8
+
+  local list=()
+  if [ "$all" = 1 ]; then
+    local d b
+    for d in "$FEATURES_ROOT"/*/; do
+      b=$(basename "$d")
+      [ -f "$d/feature.json" ] || continue
+      [ "$(jq -r '.status // "active"' "$d/feature.json" 2>/dev/null)" = "recycled" ] && continue
+      list+=("$b")
+    done
+  else
+    list=("$slug")
+  fi
+
+  # 拓扑排序：父级是基准分支的先做，父级是特性的后做（只两层就够了）
+  local first=() second=() x par
+  for x in "${list[@]}"; do
+    par=$(sync_parent_of "$x")
+    if [ -n "$par" ]; then second+=("$x"); else first+=("$x"); fi
+  done
+
+  local changed=0 problems=0
+  for x in "${first[@]}" "${second[@]}"; do
+    par=$(sync_parent_of "$x")
+    local ref="$from"
+    [ -n "$par" ] && ref="feat/$par"
+    local proj repo wt br dirty behind
+    while IFS= read -r proj; do
+      [ -n "$proj" ] || continue
+      repo=$(feature_repo_path "$x" "$proj"); wt=$(feature_wt_path "$x" "$proj"); br=$(feature_branch "$x" "$proj")
+      [ -d "$wt" ] || { echo "  跳过 $x/$proj（worktree 不存在，可能已回收）"; continue; }
+      dirty=$(gitr -C "$wt" status --porcelain 2>/dev/null | wc -l)
+      if [ "$dirty" != 0 ]; then
+        echo "  ✗ $x/$proj：worktree 有未提交改动（$dirty 项）——先提交，再 sync"; problems=1; continue
+      fi
+      if [ -n "$par" ] && ! gitr -C "$wt" rev-parse --verify -q "refs/heads/feat/$par" >/dev/null; then
+        echo "  ⚠ $x/$proj：父级分支 feat/$par 不存在 ⇒ 改用 $ref"
+      fi
+      if gitr -C "$wt" rev-parse --verify -q "$ref" >/dev/null; then
+        if gitr -C "$wt" merge-base --is-ancestor "$ref" HEAD 2>/dev/null; then
+          echo "  ✓ $x/$proj：已包含 $ref（no-op）"; continue
+        fi
+      else
+        echo "  ⚠ $x/$proj：找不到 ref $ref ⇒ 跳过"; continue
+      fi
+      behind=$(gitr -C "$wt" rev-list --count "HEAD..$ref" 2>/dev/null || echo '?')
+      echo "  → $x/$proj：合并 $ref 进 $br（待并入 $behind 个提交）"
+      [ "$check" = 1 ] && continue
+      local out rc
+      mapfile -t _id2 < <(git_identity_args "$wt")
+      out=$(gitr -C "$wt" "${_id2[@]}" merge --no-ff "$ref" -m "sync: 合并 $ref 进 $br" 2>&1); rc=$?
+      if [ "$rc" != 0 ]; then
+        # 冲突或失败：立刻回到进入前的状态，绝不留下半合并
+        gitr -C "$wt" merge --abort >/dev/null 2>&1
+        echo "    ✗ 合并失败（已 merge --abort，worktree 保持原状）："
+        printf '%s\n' "$out" | sed 's/^/      /' | head -8
+        problems=1
+      else
+        echo "    ✓ 已合并（$(gitr -C "$wt" rev-parse --short HEAD)）"; changed=$((changed+1))
+      fi
+    done < <(feature_projects "$x")
+  done
+  [ "$check" = 1 ] && { echo "（--check：只打印计划，未动任何 worktree）"; return 0; }
+  echo "sync 完成：更新了 $changed 个 worktree；问题 $problems 处"
+  # 有问题必须返回非零：调用方（夜间跑批）要据此判断"同步没成功"，不能当成功继续。
+  if [ "$problems" != 0 ]; then
+    echo "  ⇒ sync 有问题未解决，退出码 1（调用方应停下并转人工）"
+    return 1
+  fi
+  return 0
+}
+
+# ------------------------------ 分发 ------------------------------
+sub=${1:-}; shift || true
+case "$sub" in
+  new)     cmd_new "$@" ;;
+  ensure)  cmd_ensure "$@" ;;          # 幂等：不在就建、在就核对+关联（未值守入口）
+  preflight) cmd_preflight "$@" ;;     # 权限/能力预检：不需要批准就能建 worktree 吗
+  attach)  cmd_attach "$@" ;;
+  use)     cmd_attach "$@" ;;          # use 保留为 attach 的别名（旧脚本兼容）
+  switch)  cmd_switch "$@" ;;
+  detach)  cmd_detach ;;
+  status)  cmd_status ;;
+  resume)  cmd_resume "$@" ;;
+  context) cmd_context "$@" ;;
+  journal) cmd_journal "$@" ;;
+  recycle) cmd_recycle "$@" ;;
+  sync)    cmd_sync "$@" ;;          # 把父级（main→源特性→worker）最新代码合进本 worktree
+  prune)   cmd_prune "$@" ;;
+  relink)  cmd_relink "$@" ;;
+  list)    cmd_list "$@" ;;
+  current) cmd_status ;;
+  clear)   cmd_detach ;;
+  path)    cmd_path "$@" ;;
+  close)   cmd_close "$@" ;;
+  check)   exec bash "$HERE/feature-guard.sh" "$@" ;;
+  repo)    cmd_repo "$@" ;;
+  audit)   cmd_audit ;;
+  rescue)  cmd_rescue "$@" ;;
+  doctor)  cmd_doctor ;;
+  ""|-h|--help|help) usage ;;
+  *) usage; die "未知子命令：$sub" ;;
+esac

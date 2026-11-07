@@ -1,0 +1,6 @@
+# dsh-offhours 的插件层：profile 里插入一行即可；真正的配置在 config.json。
+- insert:
+    - id: offhours
+      name: dsh-offhours
+      config:
+        configFile: ''

@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="nightshift">
+  <defs>
+    <linearGradient id="ns-sky" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2b2f6b"/>
+      <stop offset="1" stop-color="#12142e"/>
+    </linearGradient>
+  </defs>
+  <rect x="3" y="3" width="58" height="58" rx="14" fill="url(#ns-sky)"/>
+  <!-- 月牙：低谷时段 -->
+  <path d="M43 17a14 14 0 1 0 0 23.5A17 17 0 0 1 43 17z" fill="#ffd166"/>
+  <circle cx="47.5" cy="21.5" r="1.6" fill="#ffd166"/>
+  <!-- 三条待办刻度：看板队列 -->
+  <g stroke="#7fd1ff" stroke-width="3.2" stroke-linecap="round">
+    <path d="M14 44h14"/>
+    <path d="M14 51h9"/>
+  </g>
+  <path d="M33 49.5l3.4 3.4 6.6-7" fill="none" stroke="#7ff0b5" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
