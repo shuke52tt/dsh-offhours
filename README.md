@@ -81,6 +81,15 @@ macOS 暂不支持（引擎用到 `flock`、`/proc`、GNU `readlink -f` 等）�
 - 送审只留 5 类：选型不确定 / 影响演进 / 实施成本 / 条件做不成 / 政策风险。
 - 卡里必须有可机械核对的判据（命令），否则 worker 不得报 done。
 
+## 社区 / Community
+
+- **源码**：https://github.com/shuke52tt/dsh-offhours
+- **npm**：https://www.npmjs.com/package/dsh-offhours（`dsh plugin --profile web add dsh-offhours`）
+- **dshmarket 索引 PR**：https://github.com/awesome-dsh-plugin/awesome-dsh-plugin/pull/13017
+- **官方 Show Your Plugins**：https://github.com/deepseek-ai/deepseek-harness/discussions/12568
+
+欢迎在官方帖或 issue 里反馈；插件按 MIT 发布。
+
 ## 开发
 
 ```bash
