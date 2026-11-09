@@ -387,7 +387,11 @@ async function buildStatus(boardArg) {
       }
     } catch { out.problems.push('systemctl 查询失败（定时器状态未知）') }
   }
-  if (configured && CFG.scheduler === 'plugin' && out.timer.active === 'unknown') {
+  if (CFG.scheduler === 'plugin' && !CFG.schedule.enabled) {
+    out.timer.active = 'disabled'
+    out.timer.raw = 'plugin schedule disabled'
+  }
+  if (configured && CFG.scheduler === 'plugin' && CFG.schedule.enabled && out.timer.active === 'unknown') {
     out.problems.push('插件内调度器没有心跳（确认 dsh 进程在跑，或 schedule.enabled=false）')
   }
 
@@ -536,11 +540,14 @@ async function buildStatus(boardArg) {
 
   // 最近日志（只取本板的行；我的日志格式是 `<时间> [<板>] ...`）
   try {
-    const lines = readText(LOG).split('\n').filter((l) => l.includes(`[${board.key}]`))
-    out.recent.log = tailLines(lines.length ? lines.join('\n') : readText(LOG), LOG_TAIL)
-  } catch {
-    out.problems.push('读不到 nightshift.log')
-  }
+    const raw = readText(LOG)
+    if (raw) {
+      const lines = raw.split('\n').filter((l) => l.includes(`[${board.key}]`))
+      out.recent.log = tailLines(lines.length ? lines.join('\n') : raw, LOG_TAIL)
+    } else {
+      out.recent.log = []
+    }
+  } catch { /* 没有日志=还没跑过，不是故障 */ }
   try {
     out.recent.runs = readdirSync(RUNS)
       .filter((f) => f.endsWith('.out') || f.endsWith('.err'))
