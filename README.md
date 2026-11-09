@@ -3,7 +3,7 @@
 DeepSeek Harness 社区插件：把看板里的待办，在**低谷/夜间**自动做掉。
 
 - 只做一件事：`todo` 卡 → 每卡一个独立 git worktree → headless worker 干活并自证 → 证据写回卡 → 合并回收。
-- 不需要 cron/systemd：插件进程内按 interval 自己扫；也可以手动 `offhours run --once`。
+- 不需要 cron/systemd：插件进程内按 interval 自己扫；也可以手动 `npx dsh-offhours run --once`。
 - 你的数据只在本地：看板是 `KANBAN.json`，状态/日志在 `stateDir`，不上传。
 
 ## 安装
@@ -14,26 +14,32 @@ dsh plugin --profile web add dsh-offhours
 
 装完重启一次 `dsh web`（或让 HMR 生效），左侧出现「夜间跑批」面板。
 
+> 为什么下面的命令写 `npx dsh-offhours`：安装插件不会把 CLI 加进全局 PATH；`npx` 会直接运行刚装好的同一个入口（首次会从 npm 取包）。如果你已经全局安装，可以简写成 `offhours`。
+
 ## 三步开始
 
 ```bash
 # 1) 在你要跑批的 git 仓库里初始化（写配置 + 建/关联特性 + 生成看板）
 cd ~/code/myapp
-offhours init --repo . --name myapp
+npx dsh-offhours init --repo . --name myapp
 
 # 2) 体检（依赖、路径、worker 权限）
-offhours doctor
+npx dsh-offhours doctor
 
 # 3) 建一张卡（自动盖当前会话；没有 session 的卡跑批不会捡）
-offhours card add "给登录页补错误提示" \
+npx dsh-offhours card add "给登录页补错误提示" \
   --summary "目标：登录失败有提示。判据：npm test 通过。不做什么：不改后端。"
 ```
 
-之后低谷时段自动跑；也可以用面板「立即跑」或 `offhours run --once`。
+之后低谷时段自动跑；也可以用面板「立即跑」或 `npx dsh-offhours run --once`。
+
+如果打开面板看到「先完成一次性初始化」，说明配置还没生成：在项目仓库执行上面的 `init`，刷新面板即可；不需要重装插件。
+
+装完/升级插件后记得重启一次 `dsh web`，面板才会加载新代码。
 
 ## 配置
 
-`~/.dsh/offhours/config.json`（`offhours init` 生成）：
+`~/.dsh/offhours/config.json`（`npx dsh-offhours init` 生成）：
 
 ```json
 {
@@ -62,13 +68,15 @@ offhours card add "给登录页补错误提示" \
 
 | 命令 | 作用 |
 |---|---|
-| `offhours init --repo .` | 初始化配置/看板/特性 |
-| `offhours doctor` | 依赖与权限体检（失败退出非 0） |
-| `offhours card add "<标题>" --summary "<目标/判据/边界>"` | 建卡并盖章当前会话 |
-| `offhours card list` | 列卡 |
-| `offhours run --once` / `--dry-run` | 手动跑一轮 / 只看会挑哪张 |
-| `offhours status` | 看板计数、心跳、最近状态（JSON） |
-| `offhours boards` | 看板列表 |
+| `npx dsh-offhours init --repo .` | 初始化配置/看板/特性 |
+| `npx dsh-offhours doctor` | 依赖与权限体检（失败退出非 0） |
+| `npx dsh-offhours card add "<标题>" --summary "<目标/判据/边界>"` | 建卡并盖章当前会话 |
+| `npx dsh-offhours card list` | 列卡 |
+| `npx dsh-offhours run --once` / `--dry-run` | 手动跑一轮 / 只看会挑哪张 |
+| `npx dsh-offhours status` | 看板计数、心跳、最近状态（JSON） |
+| `npx dsh-offhours boards` | 看板列表 |
+
+> 不想走 npx：装完后 CLI 也在 profile 的 `node_modules/.bin/offhours`（例如 `~/.dsh/profiles/web/node_modules/.bin/offhours`），可以直接用绝对路径调用。
 
 ## 依赖
 
@@ -84,7 +92,7 @@ macOS 暂不支持（引擎用到 `flock`、`/proc`、GNU `readlink -f` 等）�
 ## 社区 / Community
 
 - **源码**：https://github.com/shuke52tt/dsh-offhours
-- **npm**：https://www.npmjs.com/package/dsh-offhours（`dsh plugin --profile web add dsh-offhours`）
+- **npm**：https://www.npmjs.com/package/dsh-offhours（`npx dsh-offhours ...`）
 - **dshmarket 索引 PR**：https://github.com/awesome-dsh-plugin/awesome-dsh-plugin/pull/13017
 - **官方 Show Your Plugins**：https://github.com/deepseek-ai/deepseek-harness/discussions/12568
 

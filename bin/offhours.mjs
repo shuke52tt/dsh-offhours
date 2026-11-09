@@ -20,15 +20,16 @@ import {
 
 const HELP = `dsh-offhours —— 夜间/低谷自动跑批（配一个 git 仓库就能用）
 
-用法：
-  offhours init --repo <git仓库路径> [--name 名称] [--board KANBAN.json] [--feature 特性名]
-  offhours doctor
-  offhours card add "<标题>" --summary "<目标/判据>" [--tags auto] [--board id]
-  offhours card list [--board id]
-  offhours run [--once] [--dry-run] [--force] [--board id]
-  offhours status [--board id]
-  offhours boards
+装完插件后不需要全局安装 CLI，用 npx 调用即可：
+  npx dsh-offhours init --repo <git仓库路径> [--name 名称] [--board KANBAN.json] [--feature 特性名]
+  npx dsh-offhours doctor
+  npx dsh-offhours card add "<标题>" --summary "<目标/判据>" [--tags auto] [--board id]
+  npx dsh-offhours card list [--board id]
+  npx dsh-offhours run [--once] [--dry-run] [--force] [--board id]
+  npx dsh-offhours status [--board id]
+  npx dsh-offhours boards
 
+如果你已经全局安装了本包，也可以把 npx dsh-offhours 换成 offhours。
 全局：--config <path>（默认 ~/.dsh/offhours/config.json）
 
 约束：worker 需要 dsh、python3、bash、git、jq、flock；zstd 可选（成本统计）。
@@ -53,14 +54,14 @@ function parse(argv) {
 }
 
 function die(msg, code = 1) {
-  console.error(`offhours: ${msg}`)
+  console.error(`dsh-offhours: ${msg}`)
   process.exit(code)
 }
 
 function loadOrDie(flags) {
   const { config, path, exists } = loadConfig(flags.config)
-  if (!exists) die(`没有配置：${path}\n先运行：offhours init --repo <git仓库路径>`)
-  if (!config.boards.length) die(`配置里没有看板：${path}\n先运行：offhours init --repo <git仓库路径>`)
+  if (!exists) die(`没有配置：${path}\n先运行：npx dsh-offhours init --repo <你的 git 仓库>`)
+  if (!config.boards.length) die(`配置里没有看板：${path}\n先运行：npx dsh-offhours init --repo <你的 git 仓库>`)
   return { cfg: config, path }
 }
 
@@ -104,8 +105,13 @@ function cmdInit(flags) {
     writeFileSync(boardFile, '{\n  "version": 1,\n  "cards": []\n}\n', 'utf8')
   }
   mkdirSync(cfg.featuresRoot, { recursive: true })
+  // 合并已有登记表：init 一个新仓库不能把用户之前登记的仓库冲掉。
+  let registry = {}
+  try { registry = JSON.parse(readFileSync(join(cfg.featuresRoot, '.repos.json'), 'utf8')) || {} } catch { /* 首次初始化 */ }
+  if (!registry || typeof registry !== 'object' || Array.isArray(registry)) registry = {}
+  registry[name] = { path: repo, baseBranch: base }
   writeFileSync(join(cfg.featuresRoot, '.repos.json'),
-    JSON.stringify({ [name]: { path: repo, baseBranch: base } }, null, 2) + '\n', 'utf8')
+    JSON.stringify(registry, null, 2) + '\n', 'utf8')
   saveConfig(cfgPath, cfg)
 
   const env = {
@@ -118,6 +124,13 @@ function cmdInit(flags) {
   let r = spawnSync(fb, args, { env, encoding: 'utf8' })
   if (r.status !== 0) r = spawnSync(fb, ['ensure', feature, '--repos', name], { env, encoding: 'utf8' })
   const featOut = String((r.stdout || r.stderr || '').trim()).split('\n').slice(-2).join('\n')
+  // feature CLI 可能把登记表改写成字符串；补回 baseBranch，且不丢已有仓库。
+  try {
+    let reg2 = JSON.parse(readFileSync(join(cfg.featuresRoot, '.repos.json'), 'utf8')) || {}
+    if (!reg2 || typeof reg2 !== 'object' || Array.isArray(reg2)) reg2 = {}
+    reg2[name] = { path: repo, baseBranch: base }
+    writeFileSync(join(cfg.featuresRoot, '.repos.json'), JSON.stringify(reg2, null, 2) + '\n', 'utf8')
+  } catch { /* 保留 feature 的写法 */ }
 
   console.log(`✓ 配置：${cfgPath}`)
   console.log(`✓ 仓库：${name} → ${repo}（基准分支 ${base}）`)
@@ -126,13 +139,17 @@ function cmdInit(flags) {
   if (featOut) console.log(featOut)
   console.log('')
   console.log('下一步：')
-  console.log(`  offhours doctor`)
-  console.log(`  offhours card add "第一张卡" --summary "目标/判据/不做什么"`)
-  console.log(`  offhours run --once`)
+  console.log('  npx dsh-offhours doctor')
+  console.log('  npx dsh-offhours card add "第一张卡" --summary "目标/判据/不做什么"')
+  console.log('  npx dsh-offhours run --once')
 }
 
 function cmdDoctor(flags) {
-  const { config: cfg, path } = loadConfig(flags.config)
+  const { config: cfg, path, exists } = loadConfig(flags.config)
+  if (!exists) {
+    console.log(`未配置：${path}`)
+    console.log('先运行：npx dsh-offhours init --repo <你的 git 仓库>')
+  }
   const rows = []
   const fail = []
   const hard = (name, ok, detail = '') => {

@@ -322,6 +322,7 @@ async function buildStatus(boardArg) {
     if (Number.isFinite(n)) windowLeft = n
   } catch { /* 忽略：面板降级为不显示余量 */ }
   const COOLDOWN_MIN = cooldownMinFor(board)
+  const configured = !!(CFG._path && existsSync(CFG._path) && Array.isArray(CFG.boards) && CFG.boards.length > 0)
   const out = {
     ok: true,
     now: fmtLocal(now),
@@ -341,6 +342,13 @@ async function buildStatus(boardArg) {
     running: [],
     recent: { log: [], receipt: null, runs: [] },
     problems: [],
+    setup: {
+      configured,
+      configPath: CFG._path || '',
+      initCommand: 'npx dsh-offhours init --repo .',
+      doctorCommand: 'npx dsh-offhours doctor',
+      restartHint: '安装或更新插件后重启 dsh，面板才会加载新代码。',
+    },
   }
 
   // SCHEDULER-REPORT：按配置的调度方式如实报告（systemd / 插件内 interval）。
@@ -379,7 +387,7 @@ async function buildStatus(boardArg) {
       }
     } catch { out.problems.push('systemctl 查询失败（定时器状态未知）') }
   }
-  if (CFG.scheduler === 'plugin' && out.timer.active === 'unknown') {
+  if (configured && CFG.scheduler === 'plugin' && out.timer.active === 'unknown') {
     out.problems.push('插件内调度器没有心跳（确认 dsh 进程在跑，或 schedule.enabled=false）')
   }
 
@@ -544,6 +552,15 @@ async function buildStatus(boardArg) {
     out.recent.runs = []
   }
 
+  if (!configured) {
+    // 未配置时只展示 setup 卡片；不要把空 path 触发的“看板读不到/冷却未知”当错误吓用户。
+    out.problems = []
+    out.todos = []
+    out.reviews = []
+    out.running = []
+    out.recent = { log: [], receipt: null, runs: [] }
+    out.timer.raw = 'unconfigured'
+  }
   return out
 }
 

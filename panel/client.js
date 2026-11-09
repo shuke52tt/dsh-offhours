@@ -1001,6 +1001,7 @@ window.__ModuleLoader__.load({
       const reviews = Array.isArray(data.reviews) ? data.reviews : []
       const running = Array.isArray(data.running) ? data.running : []
       const recent = data.recent || {}
+      const setup = data.setup || {}
       const problems = (Array.isArray(data.problems) ? data.problems : []).filter(
         // 「定时器当前是 active」是正常状态，不该显示成提示（旧版宿主会多带一个换行）
         (p) => !/当前是\s*active\b/.test(String(p)),
@@ -1065,7 +1066,7 @@ window.__ModuleLoader__.load({
             h('span', { style: { fontSize: 12, color: T.textSub } }, t('boardLabel')),
             ...(Array.isArray(snap.data && snap.data.boards) && snap.data.boards.length
               ? snap.data.boards
-              : [{ key: 'ops', label: 'ops', path: '/root/ops/KANBAN.json' }]
+              : []
             ).map((b) =>
               h(
                 Button,
@@ -1086,6 +1087,33 @@ window.__ModuleLoader__.load({
           h('div', { style: { display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 4 } }, chips),
         ),
 
+        setup.configured === false
+          ? h(
+              'div',
+              {
+                style: {
+                  ...cardStyle, borderColor: T.brand, fontSize: 12, lineHeight: 1.65,
+                  display: 'flex', flexDirection: 'column', gap: 6,
+                },
+              },
+              h('div', { style: { fontWeight: 700, fontSize: 13, color: T.text } }, t('setupTitle')),
+              h('div', { style: { color: T.textSub } }, t('setupBody')),
+              h(
+                'code',
+                {
+                  style: {
+                    fontSize: 12, padding: '7px 9px', borderRadius: 8, background: T.fill,
+                    border: `1px solid ${T.borderStrong}`, wordBreak: 'break-all',
+                  },
+                },
+                setup.initCommand || 'npx dsh-offhours init --repo .',
+              ),
+              h('div', { style: { color: T.textSub } }, t('setupAfter')),
+              setup.configPath
+                ? h('div', { style: { color: T.textSub, wordBreak: 'break-all' } }, `${t('setupConfigPath')} ${setup.configPath}`)
+                : null,
+            )
+          : null,
         snap.error
           ? h('div', { style: { ...cardStyle, borderColor: T.danger, color: T.danger, fontSize: 12 } }, snap.error)
           : null,

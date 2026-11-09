@@ -77,6 +77,10 @@
     "liveEmpty": "No output yet",
     "liveFollow": "auto-follow",
     "runningNowText": "Running now:",
-    "openWorkerSession": "Open worker session"
+    "openWorkerSession": "Open worker session",
+    "setupTitle": "One-time setup",
+    "setupBody": "Run this inside the git repository you want to batch:",
+    "setupAfter": "Then reload or restart dsh. The board appears here; work only starts off-peak while the machine is idle.",
+    "setupConfigPath": "Config file:"
   }
 }

@@ -1,6 +1,6 @@
 {
   "name": "dsh-offhours",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "DSH 社区插件：把看板待办在低谷/夜间自动做掉（挑卡 → 独占 worktree → worker → 证据 → 合并回收），只依赖配置里的 git 仓库。",
   "type": "module",
   "license": "MIT",
@@ -11,7 +11,8 @@
     "./package.json": "./package.json"
   },
   "bin": {
-    "offhours": "./bin/offhours.mjs"
+    "offhours": "./bin/offhours.mjs",
+    "dsh-offhours": "./bin/offhours.mjs"
   },
   "files": [
     "bin/offhours.mjs",

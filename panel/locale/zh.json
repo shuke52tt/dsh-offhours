@@ -77,6 +77,10 @@
     "liveEmpty": "还没有输出（等它开始吐字）",
     "liveFollow": "自动跟随最新",
     "runningNowText": "正在跑批：",
-    "openWorkerSession": "打开处理会话（对话/轨迹）"
+    "openWorkerSession": "打开处理会话（对话/轨迹）",
+    "setupTitle": "先完成一次性初始化",
+    "setupBody": "在要跑批的 git 仓库里运行：",
+    "setupAfter": "然后刷新或重启 dsh；左侧会出现看板，只有低谷且机器空闲时才会自动跑。",
+    "setupConfigPath": "配置文件："
   }
 }

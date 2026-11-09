@@ -17,10 +17,11 @@ description: "夜间/低谷自动跑批（dsh-offhours）：把看板待办在�
 ## 建卡（唯一正确入口）
 
 ```bash
-offhours card add "<标题>" --summary "<目标 + 判据(命令) + 涉及面 + 不做什么>"
+npx dsh-offhours card add "<标题>" --summary "<目标 + 判据(命令) + 涉及面 + 不做什么>"
 ```
 
 - 必须在 dsh 会话里执行：它会用 `DSH_SESSION_ID` 盖章 `sourceSessionId`；
+- CLI 没进全局 PATH：统一用 `npx dsh-offhours ...`（或 profile 里的 `node_modules/.bin/offhours`）。
   **没有 sourceSessionId 的卡跑批永远不会捡**（不是 bug，是隔离要求）。
 - 用 dsh-kanban 的 `board_add` 建的卡不带 session，只适合人工看板，不适合跑批。
 - 判据必须是命令，不是形容词；一张卡 = 一个可独立合并的成果。
@@ -28,10 +29,10 @@ offhours card add "<标题>" --summary "<目标 + 判据(命令) + 涉及面 + �
 ## 查状态 / 手动跑
 
 ```bash
-offhours doctor          # 依赖、配置、权限体检（先跑这个）
-offhours status          # 看板计数 + 心跳 + 最近状态（JSON）
-offhours run --once      # 手动跑一轮（生产调度器之外）
-offhours run --dry-run   # 只看会挑哪张，不启动 worker
+npx dsh-offhours doctor          # 依赖、配置、权限体检（先跑这个）
+npx dsh-offhours status          # 看板计数 + 心跳 + 最近状态（JSON）
+npx dsh-offhours run --once      # 手动跑一轮（生产调度器之外）
+npx dsh-offhours run --dry-run   # 只看会挑哪张，不启动 worker
 ```
 
 面板：dsh Web 左侧「夜间跑批」；`/offhours` 命令也可查状态。
