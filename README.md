@@ -26,9 +26,12 @@ npx dsh-offhours init --repo . --name myapp
 # 2) 体检（依赖、路径、worker 权限）
 npx dsh-offhours doctor
 
-# 3) 建一张卡（自动盖当前会话；没有 session 的卡跑批不会捡）
+# 3) 建一张卡（必须在 dsh 会话里，或显式传当前会话 id）
+#    最省事：在 dsh 里对 agent 说「用 offhours 技能建一张卡：给登录页补错误提示」。
+#    终端命令需要带 --session；没有 sourceSessionId 的卡跑批永远不会捡。
 npx dsh-offhours card add "给登录页补错误提示" \
-  --summary "目标：登录失败有提示。判据：npm test 通过。不做什么：不改后端。"
+  --summary "目标：登录失败有提示。判据：npm test 通过。不做什么：不改后端。" \
+  --session <当前 dsh 会话 id>
 ```
 
 之后低谷时段自动跑；也可以用面板「立即跑」或 `npx dsh-offhours run --once`。
@@ -70,7 +73,7 @@ npx dsh-offhours card add "给登录页补错误提示" \
 |---|---|
 | `npx dsh-offhours init --repo .` | 初始化配置/看板/特性 |
 | `npx dsh-offhours doctor` | 依赖与权限体检（失败退出非 0） |
-| `npx dsh-offhours card add "<标题>" --summary "<目标/判据/边界>"` | 建卡并盖章当前会话 |
+| `npx dsh-offhours card add "<标题>" --summary "<目标/判据/边界>" [--session <id>]` | 建卡并盖章会话（无 session 不会跑） |
 | `npx dsh-offhours card list` | 列卡 |
 | `npx dsh-offhours run --once` / `--dry-run` | 手动跑一轮 / 只看会挑哪张 |
 | `npx dsh-offhours status` | 看板计数、心跳、最近状态（JSON） |

@@ -198,14 +198,17 @@ function cmdCard(args, flags) {
   if (sub !== 'add') die('用法：offhours card add "<标题>" --summary "..."')
   const title = args.slice(1).join(' ').trim()
   if (!title) die('card add 需要一个标题')
-  const pyArgs = [nsPy(cfg), 'card-add', board.file, title,
-    '--session', String(flags.session || process.env.DSH_SESSION_ID || ''),
-  ]
+  const sessionId = String(flags.session || process.env.DSH_SESSION_ID || '')
+  if (!sessionId && !flags['allow-no-session']) {
+    die('缺少会话 id：在 dsh 会话里运行，或显式加 --session <sessionId>。\n' +
+      '没有 sourceSessionId 的卡不会被跑批捡起；确需建无主卡（只人工看）时加 --allow-no-session。')
+  }
+  const pyArgs = [nsPy(cfg), 'card-add', board.file, title, '--session', sessionId]
   for (const k of ['summary', 'description', 'rationale', 'rejected', 'tags', 'status', 'run-timeout']) {
     if (flags[k] !== undefined) pyArgs.push(`--${k}`, String(flags[k]))
   }
   if (flags['no-explain']) pyArgs.push('--no-explain')
-  const env = { ...process.env, DSH_SESSION_ID: String(flags.session || process.env.DSH_SESSION_ID || '') }
+  const env = { ...process.env, DSH_SESSION_ID: sessionId }
   const r = spawnSync('python3', pyArgs, { env, encoding: 'utf8' })
   process.stdout.write(r.stdout || '')
   process.stderr.write(r.stderr || '')
