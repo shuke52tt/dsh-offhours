@@ -72,13 +72,31 @@ feature_is_recycled() { [ "$(feature_status "$1")" = "recycled" ]; }
 # 「在用」特性（不含已回收）：**所有「哪里能干活/该去哪里干活」的判断都必须用它**。
 # 已回收的 worktree 已经拆掉，原地只剩一个指向主检出的路标（符号链接）——
 # 它是给旧会话的引用兜底的只读入口，不再是 worktree（见 feature_retired_path）。
+# 性能（2026-11-10）：SessionStart 每次启动都要扫全部特性；原来每个 slug 起一次 jq，
+# 208 个特性时钩子要 8s。改成「一次 jq 读全部 feature.json」，把启动成本压到亚秒级。
+_feature_files() {
+  local f
+  for f in "$FEATURES_ROOT"/*/feature.json; do
+    [ -f "$f" ] && printf '%s\n' "$f"
+  done
+}
+_feature_slug_of_file() { basename "$(dirname "$1")"; }
+
 feature_slugs_active() {
-  local s
-  for s in $(feature_slugs); do feature_is_recycled "$s" || printf '%s\n' "$s"; done
+  local f
+  local -a files=()
+  while IFS= read -r f; do files+=("$f"); done < <(_feature_files)
+  [ "${#files[@]}" -gt 0 ] || return 0
+  jq -r 'select((.status // "active") != "recycled") | input_filename' "${files[@]}" 2>/dev/null \
+    | while IFS= read -r f; do _feature_slug_of_file "$f"; done
 }
 feature_slugs_recycled() {
-  local s
-  for s in $(feature_slugs); do feature_is_recycled "$s" && printf '%s\n' "$s"; done
+  local f
+  local -a files=()
+  while IFS= read -r f; do files+=("$f"); done < <(_feature_files)
+  [ "${#files[@]}" -gt 0 ] || return 0
+  jq -r 'select((.status // "active") == "recycled") | input_filename' "${files[@]}" 2>/dev/null \
+    | while IFS= read -r f; do _feature_slug_of_file "$f"; done
 }
 
 feature_projects() { feature_json "$1" | jq -r '.repos | keys[]' 2>/dev/null; }
@@ -165,14 +183,16 @@ retired_target() { # <slug> <proj> → 路标指向（readlink 优先，其次�
 }
 
 retired_of_path() { # <path> → 每行 "<slug>\t<路标路径>\t<指向>"（命中已回收特性的路标）
-  local p=$1 slug proj wt
-  for slug in $(feature_slugs_recycled); do
-    while IFS=$'\t' read -r proj wt; do
-      [ -n "$wt" ] || continue
-      [ -L "$wt" ] || continue
-      case "$p" in "$wt"|"$wt"/*) printf '%s\t%s\t%s\n' "$slug" "$wt" "$(retired_target "$slug" "$proj")"; return 0 ;; esac
-    done < <(feature_json "$slug" | jq -r '.repos | to_entries[] | "\(.key)\t\(.value.path)"' 2>/dev/null)
-  done
+  local p=$1 slug proj wt f
+  local -a files=()
+  while IFS= read -r f; do files+=("$f"); done < <(_feature_files)
+  [ "${#files[@]}" -gt 0 ] || return 1
+  while IFS=$'\t' read -r f proj wt; do
+    [ -n "$wt" ] || continue
+    [ -L "$wt" ] || continue
+    slug=$(_feature_slug_of_file "$f")
+    case "$p" in "$wt"|"$wt"/*) printf '%s\t%s\t%s\n' "$slug" "$wt" "$(retired_target "$slug" "$proj")"; return 0 ;; esac
+  done < <(jq -r 'select((.status // "active") == "recycled") | .repos | to_entries[] | [input_filename, .key, .value.path] | @tsv' "${files[@]}" 2>/dev/null)
   return 1
 }
 retired_feature_of_path() { retired_of_path "$1" 2>/dev/null | head -1 | cut -f1; }
@@ -180,13 +200,15 @@ retired_feature_of_path() { retired_of_path "$1" 2>/dev/null | head -1 | cut -f1
 # 路径落在哪个**在用**特性的 worktree 内 → 输出 slug（未命中返回 1）
 # 已回收特性刻意不参与：它们的路径只是路标，谁都不能在那儿干活。
 feature_of_path() {
-  local p=$1 slug wt
-  for slug in $(feature_slugs_active); do
-    while IFS= read -r wt; do
-      [ -n "$wt" ] || continue
-      case "$p" in "$wt"|"$wt"/*) printf '%s\n' "$slug"; return 0 ;; esac
-    done < <(feature_json "$slug" | jq -r '.repos[].path' 2>/dev/null)
-  done
+  local p=$1 slug wt f
+  local -a files=()
+  while IFS= read -r f; do files+=("$f"); done < <(_feature_files)
+  [ "${#files[@]}" -gt 0 ] || return 1
+  while IFS=$'\t' read -r f wt; do
+    [ -n "$wt" ] || continue
+    slug=$(_feature_slug_of_file "$f")
+    case "$p" in "$wt"|"$wt"/*) printf '%s\n' "$slug"; return 0 ;; esac
+  done < <(jq -r 'select((.status // "active") != "recycled") | .repos[]?.path as $p | [input_filename, $p] | @tsv' "${files[@]}" 2>/dev/null)
   return 1
 }
 

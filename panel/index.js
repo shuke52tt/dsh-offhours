@@ -132,6 +132,22 @@ function workerSessionOf(card) {
 const boardState = (b) => join(NS_DIR, `state-${b.key}.json`)
 const boardDay = (b) => join(NS_DIR, `day-${b.key}.json`)
 
+/** 常驻 daemon 心跳年龄（秒）；没有心跳文件返回 null。scan.sh --daemon 每 10s 写一次。 */
+function daemonHeartbeatAgeSec() {
+  try {
+    const ts = Number((readFileSync(join(NS_DIR, 'DAEMON.heartbeat'), 'utf8') || '0').trim())
+    if (!ts) return null
+    return Math.floor(Date.now() / 1000 - ts)
+  } catch { return null }
+}
+const DAEMON_HB_STALE_SEC = 120
+/** 'active' / 'stale(<n>s)' / 'unknown'：与 scan.sh 的 10s 心跳节拍对齐。 */
+function daemonHeartbeatState() {
+  const age = daemonHeartbeatAgeSec()
+  if (age === null) return 'unknown'
+  return age <= DAEMON_HB_STALE_SEC ? 'active' : `stale(${age}s)`
+}
+
 // 冷却时长与跑批保持同一来源：systemd 形态读 env-<board>；插件形态读 config.gates。
 function cooldownFromEnvFile(key) {
   try {
@@ -326,7 +342,8 @@ async function buildStatus(boardArg) {
   const out = {
     ok: true,
     now: fmtLocal(now),
-    board: { key: board.key, label: board.label, path: board.path, workdir: board.workdir, timer: board.timer, requireAuto: board.requireAuto },
+    board: { key: board.key, label: board.label, path: board.path, workdir: board.workdir, timer: board.timer, requireAuto: board.requireAuto, executor: board.executor || CFG.executor || 'local' },
+    executor: board.executor || CFG.executor || 'local',
     boards: BOARDS.map((b) => ({ key: b.key, label: b.label, path: b.path })),
     peak,
     timers,
@@ -352,21 +369,27 @@ async function buildStatus(boardArg) {
   }
 
   // SCHEDULER-REPORT：按配置的调度方式如实报告（systemd / 插件内 interval）。
+  // DAEMON-HEARTBEAT（分支 2026-11-04）：scan.sh --daemon 每 10s 写 DAEMON.heartbeat；
+  // 沙箱/非 systemd 环境里 is-active 常是 unknown，心跳是唯一可判活的证据，故作为兜底。
   try {
     const hb = readHeartbeat(CFG)
     const hbActive = !!(hb && hb.ageSec <= 180)
     let daemon = 'n/a'
     if (CFG.scheduler === 'systemd' && CFG.daemonUnit) daemon = await unitActive(CFG.daemonUnit)
+    const daemonHb = daemonHeartbeatState()
     out.timer = {
       active: CFG.scheduler === 'plugin'
-        ? (hbActive ? 'active' : (hb ? `stale(${hb.ageSec}s)` : 'unknown'))
-        : (daemon === 'active' || hbActive ? 'active' : (daemon === 'n/a' ? 'unknown' : daemon)),
+        ? (hbActive ? 'active' : (hb ? `stale(${hb.ageSec}s)` : daemonHb))
+        : (daemon === 'active' || hbActive || daemonHb === 'active'
+            ? 'active'
+            : (daemon !== 'n/a' && daemon !== 'unknown' ? daemon : daemonHb)),
       next: null,
       raw: CFG.scheduler === 'plugin'
-        ? `plugin interval=${CFG.schedule.intervalMin}min heartbeat=${hb ? hb.ageSec + 's' : 'none'}`
-        : `daemon=${daemon} timer=${board.timer || 'n/a'}`,
+        ? `plugin interval=${CFG.schedule.intervalMin}min heartbeat=${hb ? hb.ageSec + 's' : 'none'} daemon-hb=${daemonHb}`
+        : `daemon=${daemon} daemon-hb=${daemonHb} timer=${board.timer || 'n/a'}`,
       scheduler: CFG.scheduler === 'plugin' ? 'in-process' : (CFG.daemonUnit || board.timer || 'systemd'),
       heartbeat: hb,
+      daemonHeartbeat: daemonHb,
     }
   } catch { /* 忽略 */ }
   // 暂停标记
@@ -382,10 +405,12 @@ async function buildStatus(boardArg) {
       const ts = await timerState(board.timer)
       out.timer.next = ts.next
       out.timer.raw += ` /timer=${ts.active}`
-      if (ts.active !== 'active' && out.timer.active !== 'active') {
-        out.problems.push(`调度器未运行（/${board.timer}=${ts.active}）`)
-      }
     } catch { out.problems.push('systemctl 查询失败（定时器状态未知）') }
+  }
+  // DAEMON-ALIVE：常驻 daemon 形态下旧 timer 停用属正常 —— 只有「timer 不活且 daemon 心跳也过期」才算问题。
+  if (CFG.scheduler === 'systemd' && out.timer.active !== 'active') {
+    const age = daemonHeartbeatAgeSec()
+    out.problems.push(`调度器未运行（daemon 心跳=${age === null ? '无' : age + 's'}，/${board.timer || 'n/a'}=${out.timer.active}）`)
   }
   if (CFG.scheduler === 'plugin' && !CFG.schedule.enabled) {
     out.timer.active = 'disabled'
@@ -523,6 +548,9 @@ async function buildStatus(boardArg) {
           rejected: clip(card.rejected, 200),
           summary: clip(card.summary, 400),
           // 处理会话 id（P5 写进卡片的机器块）⇒ 面板可一键用官方「对话/轨迹」窗口打开它
+          superagentIssue: card.superagentIssue || null,
+          superagentPr: card.superagentPr || null,
+          superagentState: card.superagentState || '',
           workerSessionId: (() => {
             const m = /<!--\s*nightshift:\s*worker=([^\s]+)/.exec(String(card.description || ''))
             return m ? m[1] : ''

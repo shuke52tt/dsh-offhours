@@ -837,6 +837,13 @@ window.__ModuleLoader__.load({
                       (c.sourceSessionId ? `\n\n【来源会话】${c.sourceSessionId}` : ''))),
                 h('div', { style: { display: 'flex', gap: 6, flexWrap: 'wrap' } },
                   h(Button, { onClick: () => store.act('scan-this', { cardId: c.id }) }, t('runThisNow')),
+                  (c.superagentPr && c.superagentPr.url) || (c.superagentIssue && c.superagentIssue.url)
+                    ? h('a', {
+                        href: (c.superagentPr && c.superagentPr.url) || (c.superagentIssue && c.superagentIssue.url),
+                        target: '_blank', rel: 'noreferrer',
+                        style: { fontSize: 12, color: T.brand, alignSelf: 'center' },
+                      }, t('superagentLink'))
+                    : null,
                   c.workerSessionId
                     ? h(Button, { onClick: () => openWorkerSession(c.workerSessionId) }, t('openWorkerSession'))
                     : null,
@@ -1181,6 +1188,9 @@ window.__ModuleLoader__.load({
             { k: 'review', label: t('review'), n: reviews.length, tone: reviews.length ? T.warn : T.textSub },
             { k: 'live', label: t('running'), n: running.length, tone: running.length ? '#1a8f5a' : T.textSub },
             { k: 'doc', label: '手册', n: 0, tone: T.textSub },
+            // 工程资源入口：iframe 指向自动生成的手册站（与「手册」并列，不抢它的位置）。
+            // 用 location.hostname 而不是写死 IP：远程访问时也能指到同一台机器的 :8087。
+            { k: 'entries', label: '入口', n: 0, tone: T.textSub },
             { k: 'timers', label: '定时', n: (data.cron || []).length + 2, tone: T.textSub },
           ].map((x) => h('button', {
             key: x.k, role: 'tab', 'aria-selected': tab === x.k, onClick: () => goTab(x.k),
@@ -1242,6 +1252,13 @@ window.__ModuleLoader__.load({
         tab === 'doc'
           ? h('div', { style: { height: narrow ? '68vh' : '72vh', borderRadius: 12, overflow: 'hidden', border: `1px solid ${T.borderStrong}`, marginTop: 8 } },
               h('iframe', { src: '/nightshift/api/doc-page', title: '使用手册', style: { width: '100%', height: '100%', border: 0, display: 'block', background: '#fff' } }))
+          : null,
+
+        tab === 'entries'
+          ? h('div', { style: { height: narrow ? '68vh' : '72vh', borderRadius: 12, overflow: 'hidden', border: `1px solid ${T.borderStrong}`, marginTop: 8 } },
+              // 指向 :8087 工作台：菜单/手册/出处全部由 catalog.tsv 自动生成（15 分钟同步）。
+              // 这里只负责显示，不复制任何条目——复制就一定会漂移。
+              h('iframe', { src: `http://${location.hostname}:8087/`, title: '工程资源入口', style: { width: '100%', height: '100%', border: 0, display: 'block', background: '#fff' } }))
           : null,
 
         tab === 'live'

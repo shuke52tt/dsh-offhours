@@ -38,12 +38,12 @@ def new_board(cards):
         json.dump({"version": 1, "cards": cards}, fh, ensure_ascii=False, indent=2)
 
 
-def card(cid, title="测试卡", tags=None, desc="说明", status="todo"):
+def card(cid, title="测试卡", tags=None, desc="说明", status="todo", sid="session-selftest"):
     # sourceSessionId 是 eligible() 的硬门槛（2026-11-01 起：没有来源会话 ⇒ 一定 E_NO_SOURCE，
     # 选卡阶段就排除）。夹具必须带上，否则 pick 恒为 None、整个用例集失去意义。
     return {"id": cid, "title": title, "status": status, "tags": tags or [],
             "description": desc, "createdAt": 1, "updatedAt": 1,
-            "sourceSessionId": "session-selftest"}
+            "sourceSessionId": sid}
 
 
 def read_card(cid):
@@ -69,6 +69,16 @@ check("auto 优先于未标记者", pick["picked"]["id"] == "c2", pick["picked"]
 check("todo 总数=5", pick["todoCount"] == 5, pick["todoCount"])
 check("hold 卡被计入 held", pick["heldCount"] == 1, pick["heldCount"])
 check("决策卡被剔除（拍板/阻塞）", len(pick["decisionCards"]) == 2, pick["decisionCards"])
+
+# 2026-11-10：同源会话串行保护。两张卡来自不同会话时，active 其一只能挑另一张。
+new_board([
+    card("p1", "会话1的卡", ["auto"], sid="session-p1"),
+    card("p2", "会话2的卡", ["auto"], sid="session-p2"),
+])
+p2 = json.loads(os.popen("NIGHTSHIFT_ACTIVE_SESSIONS=session-p1 python3 %s/ns.py pick %s" % (HERE, BOARD)).read())
+check("同源会话 active 时挑不同会话卡", (p2.get("picked") or {}).get("id") == "p2", p2)
+p3 = json.loads(os.popen("NIGHTSHIFT_ACTIVE_SESSIONS='session-p1 session-p2' python3 %s/ns.py pick %s" % (HERE, BOARD)).read())
+check("全部同源会话都在跑时返回空", p3.get("picked") is None and p3.get("blockedSessionCount") == 2, p3)
 
 print("\n== 2) done 必须有证据 ==")
 new_board([card("d1")])
@@ -249,3 +259,14 @@ check("claim 后看板形状合法", ns.board_shape_errors(json.load(open(BOARD,
 
 print("\n=== 结果：%s ===" % ("全部通过" if not fails else "失败 %d 项：%s" % (len(fails), fails)))
 sys.exit(1 if fails else 0)
+
+print("\n== R) 审批窗口：全部按推荐批准覆盖无审批单卡 ==")
+new_board([
+    card("ra", "无审批单的 review", status="review"),
+    card("rb", "有审批单的 review", status="review",
+         desc="【审批单 · explain-plain】\n- O1：按推荐做｜代价小\n- O2：不做\n"),
+])
+ns.cmd_confirm_recommended([BOARD])
+check("无审批单卡也回 todo", read_card("ra")["status"] == "todo", read_card("ra")["status"])
+check("有审批单卡按推荐回 todo", read_card("rb")["status"] == "todo", read_card("rb")["status"])
+check("确认块写回无审批单卡", "【确认 " in (read_card("ra").get("description") or ""))

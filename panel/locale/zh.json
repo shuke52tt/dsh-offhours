@@ -81,6 +81,7 @@
     "setupTitle": "先完成一次性初始化",
     "setupBody": "在要跑批的 git 仓库里运行：",
     "setupAfter": "然后刷新或重启 dsh；左侧会出现看板，只有低谷且机器空闲时才会自动跑。",
-    "setupConfigPath": "配置文件："
+    "setupConfigPath": "配置文件：",
+    "superagentLink": "打开 superagent 工单"
   }
 }

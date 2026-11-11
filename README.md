@@ -40,6 +40,42 @@ npx dsh-offhours card add "给登录页补错误提示" \
 
 装完/升级插件后记得重启一次 `dsh web`，面板才会加载新代码。
 
+## 可选：把卡交给 dsh-superagent 执行（Issue 桥接）
+
+默认 `executor=local`：夜间跑批自己起 headless worker。  
+也可以让指定的看板走 **superagent 执行器**：夜间跑批只在低谷把 `todo(auto)` 卡变成 Gitea issue，superagent 的 Source → Eval → Ticket → Executor 负责独立 worktree、PR、评审和 attention；夜间跑批只回写卡状态。
+
+```json
+{
+  "executor": "superagent",
+  "superagent": {
+    "cli": "/path/to/gh-gitea",
+    "tokenFile": "~/.config/dsh-superagent/gitea-operator-token",
+    "repo": "<owner>/<repo>",
+    "baseUrl": "https://gitea.example.com",
+    "mention": "@dsh-agent"
+  },
+  "boards": [
+    { "id": "myapp", "file": "~/code/myapp/KANBAN.json", "executor": "superagent" }
+  ]
+}
+```
+
+- `tokenFile` 必须是**有权创建 issue 的操作者** token（不是 agent 自己的 token）；agent token 创建的 issue 会被 superagent Source 当作自己的消息过滤掉。
+- 只有 `todo` + `auto` + 非 `hold` 的卡会被派发；卡片状态会写 `superagentIssue` / `superagentPr` / `superagentState`。
+- `stallMinutes`（默认 30）：ticket 长时间 `working` 但无 report/attention 时，卡自动转 `review`（防 worker 等后台 gate 静默卡死）；issue 正文也会要求“前台等命令、必须 report”。
+- `dispatch` 只在低谷执行；峰段由 superagent 的 peak-pause 再兜底。
+- **不自动合并代码 PR**：PR 打开 → 卡 `review`；PR 合并 → 卡 `done`；issue 被关但未合并 → 卡 `review`。
+- superagent 与夜间跑批共用同一个仓库，superagent 的 `maxWorkers` 建议保持 1，避免同仓库并发写。
+
+手动命令：
+
+```bash
+npx dsh-offhours superagent status  --board myapp
+npx dsh-offhours superagent dispatch --board myapp --dry-run
+npx dsh-offhours superagent sync     --board myapp
+```
+
 ## 配置
 
 `~/.dsh/offhours/config.json`（`npx dsh-offhours init` 生成）：
@@ -111,3 +147,20 @@ npm pack
 ```
 
 MIT License。
+
+## 自动采集数据（dsh-rsi）
+
+RSI 自动采集的资产/经验**不放在 main**：完整历史（211 个提交、9990 个文件）在分支 **`data/dsh-rsi`**，
+该子树已被 `.gitignore` 挡住，不会随日常提交回到主干。要用它：
+
+```bash
+git fetch gitea data/dsh-rsi && git worktree add /tmp/rsi gitea/data/dsh-rsi
+```
+
+要把它变成**独立仓库**（推荐，需一次人工登录态）：
+
+```bash
+glops token --create --name glops      # 生成并保存令牌（仅一次）
+glops create dsh-rsi-data --desc "dsh-rsi 采集数据"
+git -C <你的 dsh-nightshift 检出> push "$(glops url <owner>/dsh-rsi-data | awk '/SSH/{print $NF}')" data/dsh-rsi:main
+```

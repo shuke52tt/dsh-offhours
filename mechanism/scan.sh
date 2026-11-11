@@ -63,6 +63,44 @@ ONLY_LIST=$(printf '%s' "${ONLY:-}" | tr ',' ' ')
 LOG=$RUNTIME_DIR/nightshift.log
 
 # ---------------------------------------------------------------------------
+# 执行器分派：superagent 模式不再起本地 headless worker。
+# 夜间跑批只把卡变成 Gitea issue（方案 A），superagent 的 Source/Eval/Ticket/Executor
+# 负责认领、独立 worktree、PR 与 attention；这里只做低谷闸门 + 派发 + 状态回写。
+EXECUTOR=${NIGHTSHIFT_EXECUTOR:-local}
+if [ "$EXECUTOR" = "superagent" ]; then
+  mkdir -p "$RUNTIME_DIR"
+  CFG=${NIGHTSHIFT_SUPERAGENT_CONFIG:-${OFFHOURS_CONFIG:-}}
+  BRIDGE="$SELF_DIR/superagent_bridge.py"
+  _sa_log() { printf '%s [%s] %s\n' "$(date '+%F %T')" "${NIGHTSHIFT_BOARD##*/}" "$*" >> "$LOG"; }
+  if [ -z "$CFG" ] || [ ! -f "$CFG" ]; then
+    echo "NIGHTSHIFT_SUPERAGENT_CONFIG 未设置或不存在：${CFG:-<empty>}" >&2
+    exit 2
+  fi
+  [ -f "$BRIDGE" ] || { echo "缺少 $BRIDGE" >&2; exit 2; }
+  if [ "$DRY" = 1 ]; then
+    python3 "$BRIDGE" dispatch "$BOARD" --config "$CFG" --dry-run
+    exit 0
+  fi
+  DISABLED="${DISABLED:-$RUNTIME_DIR/DISABLED}"
+  FORCE_ARG=""
+  [ "$FORCE" = 1 ] && FORCE_ARG="--force"
+  if [ "$DAEMON" = 1 ]; then
+    _sa_log "SUPERAGENT daemon 启动（派发 issue + 回写卡状态）"
+    while :; do
+      date +%s > "$RUNTIME_DIR/DAEMON.heartbeat" 2>/dev/null || true
+      [ -f "$DISABLED" ] && { _sa_log "SUPERAGENT 暂停（DISABLED）"; sleep 30; continue; }
+      python3 "$BRIDGE" dispatch "$BOARD" --config "$CFG" --limit 1 $FORCE_ARG >>"$LOG" 2>&1 || _sa_log "dispatch 失败"
+      python3 "$BRIDGE" sync "$BOARD" --config "$CFG" >>"$LOG" 2>&1 || _sa_log "sync 失败"
+      sleep 10
+    done
+  fi
+  date +%s > "$RUNTIME_DIR/DAEMON.heartbeat" 2>/dev/null || true
+  python3 "$BRIDGE" dispatch "$BOARD" --config "$CFG" --limit 1 $FORCE_ARG >>"$LOG" 2>&1 || _sa_log "dispatch 失败"
+  python3 "$BRIDGE" sync "$BOARD" --config "$CFG" >>"$LOG" 2>&1 || _sa_log "sync 失败"
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
 # worker 提示词的「稳定头」：**所有 worker 逐字节完全相同**，因此它是可被
 # DeepSeek 磁盘缓存识别并持久化的公共前缀单元（官方文档：命中要求完全匹配一个
 # 缓存前缀单元；公共前缀会在被多个请求共享后被识别持久化）。
@@ -184,13 +222,36 @@ rotate_log() {
 # 每轮跑完后立刻开始下一轮；没有可跑卡时等 10 秒再试，直到高峰/暂停。
 if [ "$DAEMON" = 1 ]; then
   log "DAEMON 启动（每轮最多 $MAX_CARDS_PER_RUN 张，轮间空档 ≤10s）"
+  # BOOT-RESET-ATTEMPTS：机器重启/实例故障后，把 attempts 清零——那是"环境中断"而不是"卡片失败"，
+  # 否则连断两次就把好卡推进 review（用户 2026-11-04 明确要求：故障后要能及时治愈回来）。
+  # 状态文件按 main 的「运行目录」口径（NIGHTSHIFT_STATE=$RUNTIME_DIR/state-<板>.json）扫描。
+  python3 - "$RUNTIME_DIR" <<'PYEOF' 2>/dev/null || true
+import json, os, sys, glob
+d = sys.argv[1]
+for f in glob.glob(os.path.join(d, "state.json")) + glob.glob(os.path.join(d, "state-*.json")):
+    try:
+        o = json.load(open(f, encoding="utf-8"))
+    except Exception:
+        continue
+    if isinstance(o, dict) and o.get("attempts"):
+        o["attempts"] = {}
+        json.dump(o, open(f, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+        print("reset attempts:", f)
+PYEOF
+  log "已清零 attempts（视为上次中断是环境故障）"
+  # HEARTBEAT-LOOP：独立的 10 秒心跳（轮次同步执行时也能证明"调度器活着"）
+  # 读写方约定：panel/index.js 的 NS_DIR 与 deploy/selfcheck.sh 都读部署目录下的 DAEMON.heartbeat，
+  # 所以写 $SELF_DIR（=扫描器所在目录）；不写 $RUNTIME_DIR，否则面板读不到。
+  ( while :; do date +%s > "$SELF_DIR/DAEMON.heartbeat" 2>/dev/null; sleep 10; done ) &
+  _HB_PID=$!
+  trap 'kill $_HB_PID 2>/dev/null' EXIT
   while :; do
     [ -f "$DISABLED" ] && { log "DAEMON 暂停（DISABLED）"; sleep 30; continue; }
     python3 "$SELF_DIR/ns.py" offpeak >/dev/null 2>&1 || { log "DAEMON 峰段休眠 60s"; sleep 60; continue; }
     # INVARIANT-HEAL：每轮后自愈（僵尸槽/错位槽/孤儿卡），把"状态一致性"变成常态而非人工
     python3 "$SELF_DIR/ns.py" invariants "$BOARD" --heal >/dev/null 2>&1 || true
     # HEARTBEAT：面板在沙箱里无法 systemctl，只能靠心跳文件判断调度器是否活着
-    date +%s > "$RUNTIME_DIR/DAEMON.heartbeat" 2>/dev/null || true
+    date +%s > "$SELF_DIR/DAEMON.heartbeat" 2>/dev/null || true
     MAX_CARDS_PER_RUN="${NIGHTSHIFT_DAEMON_MAX_PER_ROUND:-3}" "$0" --force >/dev/null 2>&1 || true
     sleep 10
   done
@@ -264,7 +325,8 @@ acquire_worker_slot() {
       rm -rf -- "$SLOTS/$i"                                          # 僵尸 ⇒ 回收
       log "回收僵尸槽位 $i（PID ${p:-未知} 已不在）"
     fi
-    mkdir -p "$SLOTS/$i" && echo $$ > "$SLOTS/$i/pid"
+    # SLOT-OWNER：槽位记录所属看板，避免对 A 板跑 invariants 时误伤 B 板的槽位
+    mkdir -p "$SLOTS/$i" && echo $$ > "$SLOTS/$i/pid" && printf '%s\n' "${BOARDKEY:-ops}" > "$SLOTS/$i/board" 2>/dev/null || true
     echo "$i"; return 0
   done
   return 1
@@ -513,6 +575,13 @@ PYST
 $PROMPT_HEAD
 
 === 本次任务（以下为逐卡变量；上面的硬规则对本次任务同样适用）===
+
+### DEVLOOP-CLOSE（2026-11-04）：与 dev-loop 闭环
+- 若工程存在 `scripts/devloop-round.sh`：**必须**按 dev-loop 一轮执行
+  `status` → `begin --round=<n>` → 干活 → `gate --all` → `finish`；
+- **判据以 gate 退出码/gate 报告为准**，不许用"看起来对"代替；
+- gate 红：只修本次改动引入的问题；与本次无关的历史红，写进卡证据并继续可做的部分；
+- 收尾把三行结论写进 `docs/devloop/ledger.md`（工程有该文件时）。
 卡片 id：$cid
 源自会话：${SOURCE_SESSION:-未记录}（DSH 无 fork CLI，血缘记在卡上）
 工作区：$WORKDIR （看板文件 $BOARD 由外层脚本维护：**你不要读改看板、也不要调用 board 相关工具——本 profile 没有它们**）
@@ -783,6 +852,9 @@ if [ "$PARALLEL" -gt 1 ] && [ "$DRY" != 1 ]; then
     # 波次循环：每波并发 PARALLEL 张，跑满 MAX_CARDS_PER_RUN 为止
     # 2026-11-01：槽位一空就补位（条件加 pids 非空）
     pids=""; wave_n=0        # 只在进入循环前初始化一次；循环内不得重置，否则会丢掉仍在跑的 pid
+    # 2026-11-10：同源会话串行保护。同一 sourceSessionId 的多张卡并行时 merge-back 会撞
+    # 同一个源 worktree（实测 .devloop/posture 冲突、结果行串味），本轮只放一个 worker。
+    ACTIVE_SESSIONS=""
     while [ "$launched" -lt "$MAX_CARDS_PER_RUN" ] || [ -n "$pids" ]; do
     wave=$((wave+1))
     while [ "$wave_n" -lt "$PARALLEL" ] && [ "$launched" -lt "$MAX_CARDS_PER_RUN" ]; do
@@ -791,7 +863,7 @@ if [ "$PARALLEL" -gt 1 ] && [ "$DRY" != 1 ]; then
         if r=$(budget_deny_reason); then log "预算拒绝：$r"; break; fi
         if r=$(cost_deny_reason); then log "花费拒绝：$r"; break; fi
       fi
-      PICK=$(python3 "$SELF_DIR/ns.py" pick "$BOARD")
+      PICK=$(NIGHTSHIFT_ACTIVE_SESSIONS="$ACTIVE_SESSIONS" python3 "$SELF_DIR/ns.py" pick "$BOARD")
       cid=$(printf '%s' "$PICK" | python3 -c "import sys,json;print((json.load(sys.stdin).get('picked') or {}).get('id',''))")
       [ -n "$cid" ] || break
       title=$(printf '%s' "$PICK" | python3 -c "import sys,json;print((json.load(sys.stdin).get('picked') or {}).get('title',''))")
@@ -828,7 +900,14 @@ if [ "$PARALLEL" -gt 1 ] && [ "$DRY" != 1 ]; then
       SRC_S=$(printf '%s\n' "$SRC" | sed -n 's/^SESSION=//p')
       SRC_F=$(printf '%s\n' "$SRC" | sed -n 's/^FEATURE=//p')
       SRC_P=$(printf '%s\n' "$SRC" | sed -n 's/^PROJECT=//p')
+      # source-of 在“自动建特性”的卡上只返回 E_DRY_RUN（父进程不建特性），不带 SESSION；
+      # 这时用 pick 自带的 sourceSessionId 作为串行键，否则同源会话保护会漏掉首轮。
+      if [ -z "$SRC_S" ]; then
+        SRC_S=$(printf '%s' "$PICK" | python3 -c "import sys,json;print((json.load(sys.stdin).get('picked') or {}).get('sourceSessionId') or '')" 2>/dev/null || true)
+      fi
       SRC_W=$(printf '%s\n' "$SRC" | sed -n 's/^WORKTREE=//p')
+      # 这张卡的源会话进入本轮 active 集：同会话下一张卡等到下一轮/下一波。
+      [ -n "$SRC_S" ] && ACTIVE_SESSIONS="$ACTIVE_SESSIONS $SRC_S"
       log "并行开跑（$((launched+1))/$PARALLEL）：$title（card=$cid）"
       (
         export NIGHTSHIFT_SOURCE_SESSION="$SRC_S" NIGHTSHIFT_SOURCE_FEATURE="$SRC_F" \

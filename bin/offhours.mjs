@@ -28,6 +28,7 @@ const HELP = `dsh-offhours —— 夜间/低谷自动跑批（配一个 git 仓�
   npx dsh-offhours run [--once] [--dry-run] [--force] [--board id]
   npx dsh-offhours status [--board id]
   npx dsh-offhours boards
+  npx dsh-offhours superagent dispatch|sync|status [--board id] [--dry-run] [--force]
 
 如果你已经全局安装了本包，也可以把 npx dsh-offhours 换成 offhours。
 全局：--config <path>（默认 ~/.dsh/offhours/config.json）
@@ -163,6 +164,12 @@ function cmdDoctor(flags) {
     hard(`仓库 ${b.repos[0] || '?'}`, !!cfg.repos[b.repos[0]] && existsSync(cfg.repos[b.repos[0]].path),
       (cfg.repos[b.repos[0]] || {}).path || '(未登记)')
   }
+  if (cfg.boards.some((b) => b.executor === 'superagent')) {
+    const sa = cfg.superagent || {}
+    hard('superagent cli', !!sa.cli && existsSync(sa.cli), sa.cli || '未配置')
+    hard('superagent token', !!sa.tokenFile && existsSync(sa.tokenFile), sa.tokenFile || '未配置')
+    hard('superagent repo', !!sa.repo, sa.repo || '未配置')
+  }
   for (const [name, bin] of [['python3', 'python3'], ['bash', 'bash'], ['git', 'git'], ['jq', 'jq'], ['flock', 'flock'], ['dsh', cfg.dshBin]]) {
     const p = which(bin)
     hard(name, !!p, p || '未找到')
@@ -266,6 +273,21 @@ function main() {
     const { cfg } = loadOrDie(flags)
     for (const b of cfg.boards) console.log(`${b.id}\t${b.file}`)
     return
+  }
+  if (cmd === 'superagent') {
+    const { cfg, path } = loadOrDie(flags)
+    const board = boardOf(cfg, flags)
+    const sub = _[1] || 'status'
+    if (!['dispatch', 'sync', 'status'].includes(sub)) die('用法：superagent dispatch|sync|status')
+    const py = join(packageRoot(), 'mechanism', 'superagent_bridge.py')
+    const args = [py, sub, board.file, '--config', path]
+    if (flags.limit) args.push('--limit', String(flags.limit))
+    if (flags['dry-run']) args.push('--dry-run')
+    if (flags.force) args.push('--force')
+    const r = spawnSync('python3', args, { encoding: 'utf8', env: process.env })
+    process.stdout.write(r.stdout || '')
+    process.stderr.write(r.stderr || '')
+    process.exit(r.status || 0)
   }
   die(`未知命令：${cmd}\n\n${HELP}`)
 }

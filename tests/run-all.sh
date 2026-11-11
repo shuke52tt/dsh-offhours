@@ -12,6 +12,7 @@ run bash "$HERE/e2e-cards.sh"
 run bash "$HERE/e2e-main.sh"
 run bash "$HERE/e2e-master.sh"
 run bash "$HERE/e2e-cli.sh"
+run bash "$HERE/e2e-superagent.sh"
 echo; echo "### mechanism/selftest.py"
 python3 "$ROOT/mechanism/selftest.py" >/tmp/ns-selftest.out 2>&1 && tail -1 /tmp/ns-selftest.out || { rc=1; tail -20 /tmp/ns-selftest.out; }
 echo; echo "### feature selftest"

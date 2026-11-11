@@ -385,7 +385,9 @@ def eligible(card):
     # HOLD_IN_TEXT（2026-11-01）：标题或描述里写明 HOLD 的卡（外部依赖未就绪，如"需 key+设备"）
     # 以前只写在标题里、没有 hold 标签 ⇒ 会被反复挑中然后必然失败。
     _t = (card.get("title") or "") + "\n" + (card.get("description") or "")[:2000]
-    if "HOLD" in _t.upper() and "解除" not in _t:
+    # 2026-11-04：不再用"解除"二字做豁免（说明文字里的"解除 hold"会把阻塞卡误放行）。
+    # 放行必须显式加结构化标签 released（或去掉标题里的 HOLD）。
+    if "HOLD" in _t.upper() and "released" not in tags:
         return False
     if REQUIRE_AUTO and "auto" not in tags:
         return False
@@ -440,8 +442,17 @@ def cmd_pick(argv):
 
     cand = [c for c in todos if eligible(c)]
     decisions = [c for c in cand if is_decision(c)]
-    runnable = sorted([c for c in cand if not is_decision(c)],
-                      key=lambda c: 0 if "auto" in _tags(c) else 1)     # auto 优先
+    runnable_all = sorted([c for c in cand if not is_decision(c)],
+                          key=lambda c: 0 if "auto" in _tags(c) else 1)     # auto 优先
+    # 同源会话串行保护：同一次扫描里，同一个 sourceSessionId 只允许一个 worker。
+    # 原因（2026-11-10 实测）：同一会话派生的多张卡虽然各有 worker worktree，但 merge-back
+    # 都回到同一个源 worktree；并行合并会撞 .devloop/posture / worker-progress，并让 worker
+    # 看到别人的现场，最终出现「结果行无法解析/串味」。宁可串行，不要串味。
+    active_sessions = {x for x in os.environ.get("NIGHTSHIFT_ACTIVE_SESSIONS", "").split() if x}
+    blocked = [c for c in runnable_all
+               if (c.get("sourceSessionId") or "").strip() in active_sessions]
+    runnable = [c for c in runnable_all
+                if (c.get("sourceSessionId") or "").strip() not in active_sessions]
     missing_session = [c for c in todos if not (c.get("sourceSessionId") or "").strip()]
     picked = runnable[0] if runnable else None
     reason = None
@@ -453,6 +464,9 @@ def cmd_pick(argv):
                       "或在 dsh 会话里给它补 --session）" % len(missing_session))
         elif not cand:
             reason = "所有 todo 都标了 hold（禁跑）"
+        elif blocked:
+            reason = ("同源会话已有 worker 在跑（%d 张同会话卡暂时串行），等这一波结束再跑"
+                      % len(blocked))
         else:
             reason = "只剩需你拍板的卡（%d 张），无人值守不碰" % len(decisions)
     print(json.dumps({
@@ -463,6 +477,7 @@ def cmd_pick(argv):
             "sourceSessionId": picked.get("sourceSessionId") or ""},
         "reason": reason,
         "todoCount": len(todos), "runnableCount": len(runnable),
+        "blockedSessionCount": len(blocked),
         "decisionCards": [{"id": c["id"], "title": c["title"][:60]} for c in decisions],
         "heldCount": len(todos) - len(cand),
         "missingSessionCount": len(missing_session),
@@ -1245,13 +1260,22 @@ def cmd_confirm_recommended(argv):
     done = skipped = 0
     for c in [x for x in board.get("cards", []) if x.get("status") == "review"]:
         desc = c.get("description") or ""
-        if "【审批单 · explain-plain】" not in desc:
-            skipped += 1
-            continue
         opts = [l.strip() for l in desc.splitlines() if l.strip().startswith("- O")]
         rec = [l for l in opts if "推荐" in l] or opts[:1]
-        if not rec:
-            skipped += 1
+        # 2026-11-10：审批窗口对「没有审批单」的 review 卡也显示「全部按推荐批准」。
+        # 以前这里静默跳过 ⇒ 按钮看起来无效。没有审批单时退化为单卡一键放行
+        # （与卡上「审核通过（回待办）」完全同一结论；hold 仍保留，除非显式 --unhold）。
+        if "【审批单 · explain-plain】" not in desc or not rec:
+            decision = "审核通过（按卡内推荐执行）"
+            detail = "人审通过 ⇒ 回到待办，由后续轮次按卡内推荐执行"
+            if dry:
+                print("DRY  %-20s ← %s" % (c["id"][:20], decision))
+                continue
+            rc = cmd_confirm([board_path, c["id"], decision, detail, "--by", by])
+            if rc == 0:
+                done += 1
+            else:
+                skipped += 1
             continue
         text = rec[0]
         m = re.match(r"-\s*(O\d+)[：:]\s*(.*)$", text)
@@ -1566,6 +1590,25 @@ def _source_worktree(card, allow_create=False):
             return None, "E_ASSOC_INCOMPLETE 源会话关联文件缺 feature/project：%s" % assoc_path
         ok, why = _feature_counts_as_usable(feature, project)
         if not ok:
+            # P2-ASSOC-HOLD（2026-11-04）：源特性缺失 ⇒ 这张卡每次被领都会失败。
+            # 在这里就把 hold 打上并写清原因，停止空转；人修好关联后去掉 hold 即可。
+            try:
+                def _fix(bd):
+                    cc = _find(bd, card["id"])
+                    if cc is None:
+                        return False
+                    tags = list(cc.get("tags") or [])
+                    if "hold" not in [t.lower() for t in tags]:
+                        tags.append("hold")
+                        cc["tags"] = tags
+                        cc["description"] = (cc.get("description") or "").rstrip() + (
+                            "\n【自动止血 %s】源特性缺失（%s）⇒ 已加 hold 停止空转；请 feature attach 后去掉 hold。\n"
+                            % (time.strftime("%Y-%m-%d %H:%M"), (why or "")[:80]))
+                        cc["updatedAt"] = int(time.time() * 1000)
+                    return True
+                mutate_board(board_path or KANBAN_DEFAULT, _fix)
+            except Exception:
+                pass
             return None, "E_ASSOC_STALE %s；请重新 feature attach <特性名>（或删掉该关联后重跑）" % why
         wt = _feature_worktree(feature, project)
         return {"session": sid, "feature": feature, "project": project, "worktree": wt}, ""
@@ -2221,6 +2264,14 @@ def cmd_invariants(argv):
             if heal:
                 _sh.rmtree(sp, ignore_errors=True); healed.append("释放僵尸槽 %s" % d)
             continue
+        # SLOT-BOARD-SCOPE：只处置"属于本看板"的槽位，避免跨板误伤（2026-11-04 故障注入发现）
+        try:
+            _owner = open(_os.path.join(sp, "board")).read().strip()
+        except Exception:
+            _owner = ""
+        _mykey = _os.path.basename(_os.path.dirname(_os.path.abspath(path))) or ""
+        if _owner and _mykey and _owner != _mykey:
+            continue
         try:
             card = open(_os.path.join(sp, "card")).read().strip()
         except Exception:
@@ -2228,12 +2279,60 @@ def cmd_invariants(argv):
         if card:
             if card in seen:
                 violations.append({"inv": "I4", "slot": d, "why": "卡 %s 同占 %s/%s" % (card[:16], seen[card], d)})
+                if heal:
+                    # 保留先出现的那个槽，释放重复槽（避免同卡被两个 worker 抢着写）
+                    import shutil as _sh2
+                    _sh2.rmtree(sp, ignore_errors=True)
+                    healed.append("释放重复槽 %s（卡 %s 已由槽 %s 占用）" % (d, card[:16], seen[card]))
+                    continue
             seen[card] = d
             if card not in ip:
                 violations.append({"inv": "I1", "slot": d, "card": card[:16], "why": "槽位占着非 in_progress 卡"})
                 if heal:
                     _sh.rmtree(sp, ignore_errors=True); healed.append("释放槽 %s" % d)
     return_viol = list(violations)
+    # I5（2026-11-04）：已有人工【确认】且确认时间晚于最后一次【送审】的 review 卡，
+    # 说明"批准→回待办"这一步没落地（面板/confirm-all 路径都可能漏）⇒ 自愈推回 todo。
+    import re as _re
+    _review = [c for c in b.get("cards", []) if c.get("status") == "review"]
+    _advanced = []
+    for c in _review:
+        desc = c.get("description") or ""
+        confs = _re.findall(r"【确认 (\d{4}-\d{2}-\d{2} \d{2}:\d{2})", desc)
+        subms = _re.findall(r"【夜间跑批送审 (\d{4}-\d{2}-\d{2} \d{2}:\d{2})", desc)
+        if not confs:
+            continue
+        if subms and confs[-1] < subms[-1]:
+            continue                      # 批准后又被重新送审 ⇒ 需要人再看，不动
+        # P1（2026-11-04）：收窄三处误判 ——
+        # ① 正在被 worker 跑（槽位里有它）⇒ 不动；② 有活槽位（一轮在跑）⇒ 不动；
+        # ③ 最后一次送审在 30 分钟内 ⇒ 视为"刚送审，可能还在流转"，不动。
+        if c["id"] in seen:
+            continue
+        if len(seen) > 0:
+            continue
+        try:
+            import time as _t
+            if subms:
+                _last = _t.mktime(_t.strptime(subms[-1], "%Y-%m-%d %H:%M"))
+                if _t.time() - _last < 1800:
+                    continue
+        except Exception:
+            pass
+        if heal:
+            def _mut(bd, _cid=c["id"], _conf=confs[-1]):
+                cc = _find(bd, _cid)
+                if cc is None or cc.get("status") != "review":
+                    return False
+                cc["status"] = "todo"
+                cc["description"] = (cc.get("description") or "").rstrip() + (
+                    "\n【推进自愈 %s】有效确认(%s)但状态仍 review ⇒ 回 todo。\n" % (time.strftime("%Y-%m-%d %H:%M"), _conf))
+                cc["updatedAt"] = int(time.time() * 1000)
+                return True
+            if mutate_board(path, _mut) == "ok":
+                _advanced.append(c["id"][:16]); healed.append("批准未推进 ⇒ 回 todo %s" % c["id"][:16])
+        else:
+            return_viol.append({"inv": "I5", "card": c["id"][:16], "why": "已有效确认但仍是 review（批准→待办未落地）"})
     for cid in list(ip):
         if cid in seen:
             continue

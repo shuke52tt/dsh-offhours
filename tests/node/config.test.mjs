@@ -60,3 +60,23 @@ test('resolveBoard + scanEnv：引擎环境不依赖主机路径', () => {
     assert.ok(!String(env[k]).includes('/root/'), `${k} 不应带主机路径`)
   }
 })
+test('executor=superagent：板级继承与 scanEnv 传递', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'offhours-sa-'))
+  writeFileSync(join(dir, 'board.json'), '{"version":1,"cards":[]}\n')
+  const p = join(dir, 'config.json')
+  writeFileSync(p, JSON.stringify({
+    executor: 'superagent',
+    stateDir: './state', featuresRoot: './features',
+    superagent: { cli: '/bin/echo', tokenFile: './token', repo: 'demo/demo' },
+    repos: { demo: { path: dir } },
+    boards: [{ id: 'demo', file: './board.json', workdir: '.', repos: ['demo'] }],
+  }))
+  const { config } = loadConfig(p)
+  assert.equal(config.executor, 'superagent')
+  assert.equal(config.boards[0].executor, 'superagent')
+  assert.equal(config.superagent.tokenFile, join(dir, 'token'))
+  const env = scanEnv(config, config.boards[0])
+  assert.equal(env.NIGHTSHIFT_EXECUTOR, 'superagent')
+  assert.equal(env.NIGHTSHIFT_SUPERAGENT_CONFIG, p)
+})
+

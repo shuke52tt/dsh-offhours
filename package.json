@@ -1,7 +1,7 @@
 {
   "name": "dsh-offhours",
-  "version": "0.1.4",
-  "description": "DSH 社区插件：把看板待办在低谷/夜间自动做掉（挑卡 → 独占 worktree → worker → 证据 → 合并回收），只依赖配置里的 git 仓库。",
+  "version": "0.2.0",
+  "description": "DSH 社区插件：把看板待办在低谷/夜间自动做掉；可选把卡交给 dsh-superagent 执行",
   "type": "module",
   "license": "MIT",
   "main": "panel/index.js",
@@ -26,6 +26,7 @@
     "mechanism/scan.sh",
     "mechanism/ns.py",
     "mechanism/selftest.py",
+    "mechanism/superagent_bridge.py",
     "feature-worktrees/feature",
     "feature-worktrees/feature-lib.sh",
     "feature-worktrees/feature-guard.sh",
@@ -38,7 +39,7 @@
   "scripts": {
     "prepack": "node scripts/gen-client.mjs",
     "gen:client": "node scripts/gen-client.mjs",
-    "test": "node --test tests/*.test.mjs",
+    "test": "node --test tests/node/*.test.mjs",
     "check": "node --check panel/index.js && node --check lib/config.js && node --check lib/runtime.js && node --check bin/offhours.mjs"
   },
   "engines": {
