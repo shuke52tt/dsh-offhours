@@ -156,16 +156,16 @@ EOF
 # 稳定头哈希：用于在日志里"看得见缓存前缀有没有被改坏"
 PREFIX_HEAD_HASH=$(printf '%s' "$PROMPT_HEAD" | sha1sum | cut -c1-16)
 BOARDKEY=$(basename "$(dirname "$BOARD")")          # 先定义：锁/槽位/状态文件都要它
-LOCK=$RUNTIME_DIR/.lock-$BOARDKEY          # 每板一把锁（2026-10-16：允许 ops/hemou 并行）
+LOCK=$RUNTIME_DIR/.lock-$BOARDKEY          # 每板一把锁（允许不同看板并行）
 SLOTS=$RUNTIME_DIR/slots                   # 全局 worker 槽位（跨板并发上限）
 MAX_WORKERS=${NIGHTSHIFT_MAX_WORKERS:-3}
 RUNS=$RUNTIME_DIR/runs
 # 跑批前后要盯住的主检出（git 仓库）；一变就把卡转待审。见 README「事后侦测」一节。
-# 两个实例（ops / hemou）必须各自隔离状态：预算、冷却、尝试计数都按看板分开，
+# 多个看板实例必须各自隔离状态：预算、冷却、尝试计数都按看板分开，
 # 否则一个板跑掉今天额度会影响另一个板（2026-10-16 修复）。
 # 守卫仓库：项目名（查特性登记表 .repos.json）或主检出路径；跑批会按卡覆盖。
 # 兼容旧键 GUARD_REPOS：旧 env 文件写的是 GUARD_REPOS，但脚本原来只读 NIGHTSHIFT_GUARD_REPOS，
-# 导致配置静默失效（2026-10-18 复盘发现：ops 板 GUARD_REPOS=hemou 实际没生效）。
+# 导致配置静默失效（旧 env 文件里的 GUARD_REPOS 需要继续兼容）。
 LEGACY_GUARD=${GUARD_REPOS:-}
 GUARD_REPOS=${NIGHTSHIFT_GUARD_REPOS:-${LEGACY_GUARD:-}}
 GUARD_REPOS=${GUARD_REPOS//,/ }

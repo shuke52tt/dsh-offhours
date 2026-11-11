@@ -199,7 +199,7 @@ def cmd_dispatch(board_path: str, config_path: str, limit: int, dry: bool, force
                 "body": issue_body(board, card, sa),
             })
             number = issue.get("number")
-            url = issue.get("html_url") or (f"{sa['baseUrl']}/lengr/hemou/issues/{number}" if sa["baseUrl"] else "")
+            url = issue.get("html_url") or (f"{sa['baseUrl']}/{sa['repo']}/issues/{number}" if sa["baseUrl"] else "")
             card["status"] = "in_progress"
             card["superagentIssue"] = {"number": number, "url": url, "at": now_iso()}
             card["superagentState"] = "issue-open"

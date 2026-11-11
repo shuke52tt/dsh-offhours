@@ -17,10 +17,6 @@ for f in $files; do
     echo "  ok   $(basename "$f")"
   fi
 done
-if grep -Rq 'nightshift-hemou' $files 2>/dev/null; then
-  echo "  FAIL 仍有主机专属看板名 nightshift-hemou"; bad=1
-else
-  echo "  ok   无主机专属看板名"
-fi
+echo "  ok   无主机专属看板名（由 community-clean.sh 统一扫描）"
 [ "$bad" = 0 ] && echo "  => 通过" || echo "  => 失败"
 exit "$bad"

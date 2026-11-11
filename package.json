@@ -1,6 +1,6 @@
 {
   "name": "dsh-offhours",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "DSH 社区插件：把看板待办在低谷/夜间自动做掉；可选把卡交给 dsh-superagent 执行",
   "type": "module",
   "license": "MIT",
@@ -30,7 +30,6 @@
     "feature-worktrees/feature",
     "feature-worktrees/feature-lib.sh",
     "feature-worktrees/feature-guard.sh",
-    "feature-worktrees/selftest.sh",
     "skills/offhours/SKILL.md",
     "cordis.patch.yml",
     "README.md",
@@ -40,7 +39,8 @@
     "prepack": "node scripts/gen-client.mjs",
     "gen:client": "node scripts/gen-client.mjs",
     "test": "node --test tests/node/*.test.mjs",
-    "check": "node --check panel/index.js && node --check lib/config.js && node --check lib/runtime.js && node --check bin/offhours.mjs"
+    "check": "node --check panel/index.js && node --check lib/config.js && node --check lib/runtime.js && node --check bin/offhours.mjs",
+    "prepublishOnly": "bash tests/community-clean.sh"
   },
   "engines": {
     "node": ">=20"

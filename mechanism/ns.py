@@ -46,7 +46,7 @@ RECEIPT_TITLE = "夜间跑批回执（自动维护）"
 RECEIPT_KEEP = 10
 # 门槛可配：默认「todo 且非 hold」都算可跑（ops 板口径）。
 # 置 NIGHTSHIFT_REQUIRE_AUTO=1 改为「必须带 auto 才算可跑」——给那些**显式约定 auto** 的看板用
-# （hemou 板就是这套：作者只在明确可无人值守时才打 auto，其余待办属别的线或等人拍板）。
+# （推荐做法：只在明确可无人值守时才打 auto，其余待办留给人拍板）。
 MAX_ATTEMPTS = int(os.environ.get("MAX_ATTEMPTS", "2"))   # 与 scan.sh 同源：连续未完成多少次后转送审
 REQUIRE_AUTO = os.environ.get("NIGHTSHIFT_REQUIRE_AUTO", "0").lower() not in ("0", "", "false", "no")
 
@@ -288,7 +288,7 @@ def card_shape_errors(card):
 
     为什么要有这道闸门：插件用 `cards.every(isBoardCard)` 判定整板；**一张卡的字段类型不对
     就会让整板被判「shape 不对」→ 看板页与所有 board_* 工具全部失效**（2026-10-16 实测：
-    hemou 板 110 张里恰好 1 张的 rationale 被写成了数组，整页因此什么都不显示）。
+    某看板里恰好 1 张卡的 rationale 被写成了数组，整页因此什么都不显示）。
     插件的立场是「fail loud，不静默修复」，这里同样：宁可不写，也不把坏形状落盘。
     """
     e = []
@@ -1388,7 +1388,7 @@ def _project_name(name_or_path):
 
 
 def _auto_project():
-    """自动特性的工程：显式 NIGHTSHIFT_AUTO_PROJECT > 守卫列表第一项 > hemou。"""
+    """自动特性的工程：显式 NIGHTSHIFT_AUTO_PROJECT > 守卫列表第一项 > 空。"""
     explicit = os.environ.get("NIGHTSHIFT_AUTO_PROJECT", "").strip()
     if explicit:
         return explicit
